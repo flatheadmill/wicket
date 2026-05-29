@@ -241,14 +241,14 @@ async fn handle_shell(tx: &WsSender, call_id: &str, data: Value) {
                 format!("{}{}", stdout, stderr)
             };
             let code = out.status.code().unwrap_or(-1);
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "shell_result", json!({
                 "call_id": call_id,
                 "output": combined,
                 "exit_code": code,
             }));
         }
         Err(e) => {
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "shell_result", json!({
                 "call_id": call_id,
                 "output": format!("failed to execute: {}", e),
                 "exit_code": 1,
