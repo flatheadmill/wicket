@@ -418,13 +418,13 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let wicket_url = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("usage: smedly <wicket-ws-url> [slug]");
+        eprintln!("usage: smedly <wicket-ws-url> <slug> [host-identity]");
         std::process::exit(1);
     });
     let slug = args.get(2).cloned().unwrap_or_else(|| "_smedly".to_string());
+    let host_identity = args.get(3).cloned().unwrap_or_else(|| "localhost".to_string());
 
-    let hostname = gethostname();
-    tracing::info!(url = %wicket_url, slug = %slug, host = %hostname, "smedly starting");
+    tracing::info!(url = %wicket_url, slug = %slug, host = %host_identity, "smedly starting");
 
     let (ws_stream, _) = match tokio_tungstenite::connect_async(&wicket_url).await {
         Ok(s) => s,
@@ -440,7 +440,7 @@ async fn main() {
     let connect = json!({
         "slug": slug,
         "protocol": "smedly",
-        "host": hostname,
+        "host": host_identity,
     });
     if ws_sink.send(Message::text(connect.to_string())).await.is_err() {
         tracing::error!("failed to send connect payload");
