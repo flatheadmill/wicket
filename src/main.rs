@@ -1,11 +1,11 @@
-// Smedly: tool executor that connects back to Wicket over WebSocket.
+// Wicket: tool executor that connects back to Easement over WebSocket.
 //
 // Receives tool call envelopes (zsh, apply_patch, view_image, shell),
-// executes them in a sandbox, returns results. One Smedly per host.
+// executes them in a sandbox, returns results. One Wicket per host.
 //
 // Usage:
-//   smedly ws://localhost:6502           # local executor
-//   ssh host smedly ws://localhost:6502  # remote executor (via SSH tunnel)
+//   wicket ws://localhost:6502           # local executor
+//   ssh host wicket ws://localhost:6502  # remote executor (via SSH tunnel)
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,19 +24,19 @@ fn init_tracing() -> WorkerGuard {
     let log_dir = Path::new(&home)
         .join(".local")
         .join("state")
-        .join("smedly");
+        .join("wicket");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("smedly.log"))
-        .expect("failed to open smedly.log");
+        .open(log_dir.join("wicket.log"))
+        .expect("failed to open wicket.log");
 
     let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("smedly=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("wicket=debug"));
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
@@ -63,7 +63,7 @@ fn ws_emit(tx: &WsSender, stream: &str, data: Value) {
 fn log_wire(slug: &str, dir: &str, raw: &str) {
     let home = std::env::var("HOME").unwrap_or_default();
     let log_dir = Path::new(&home)
-        .join(".local/state/smedly")
+        .join(".local/state/wicket")
         .join(slug);
     let _ = std::fs::create_dir_all(&log_dir);
     let path = log_dir.join("wire.jsonl");
@@ -90,7 +90,7 @@ struct SandboxConfig {
 fn read_sandbox_config(slug: &str) -> SandboxConfig {
     let home = std::env::var("HOME").unwrap_or_default();
     let path = Path::new(&home)
-        .join(".local/state/smedly")
+        .join(".local/state/wicket")
         .join(slug)
         .join("sandbox.conf");
 
@@ -178,19 +178,132 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
 
 // -- Tool handlers --
 
-async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, data: Value) {
+async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let sandboxed = data.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true);
-    tracing::info!(command = %command, sandboxed, "zsh exec");
+    let run_bg = data.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
+    let timestamp = data.get("timestamp").and_then(|v| v.as_str()).unwrap_or("default");
+    let task_uuid = data.get("task_uuid").and_then(|v| v.as_str()).unwrap_or("");
+    tracing::info!(command = %command, sandboxed, run_bg, "zsh exec");
+
+    if run_bg {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let output_dir = Path::new(&home)
+            .join(".local/state/wicket")
+            .join(slug)
+            .join(timestamp)
+            .join(host_identity);
+        let _ = std::fs::create_dir_all(&output_dir);
+        let output_path = output_dir.join(format!("{}.txt", task_uuid));
+
+        let file = match std::fs::File::create(&output_path) {
+            Ok(f) => f,
+            Err(e) => {
+                ws_emit(tx, "tool_result", json!({
+                    "call_id": call_id,
+                    "output": format!("failed to create output file: {}", e),
+                    "exit_code": 1,
+                }));
+                return;
+            }
+        };
+        let stdout_file = file.try_clone().unwrap();
+        let stderr_file = file;
+
+        let mut cmd = if sandboxed {
+            let config = read_sandbox_config(slug);
+            let mut c = build_sandbox_command(command, &config);
+            c.env("RUNNING_UNDER_WICKET", "1");
+            c
+        } else {
+            let mut c = tokio::process::Command::new("zsh");
+            c.env("RUNNING_UNDER_WICKET", "1");
+            c.arg("-c").arg(command);
+            c
+        };
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                ws_emit(tx, "tool_result", json!({
+                    "call_id": call_id,
+                    "output": format!("Background task {} started. Output: {}", task_uuid, output_path.display()),
+                    "exit_code": 0,
+                }));
+
+                let tx = tx.clone();
+                let output_path = output_path.clone();
+                let task_uuid = task_uuid.to_string();
+                let is_localhost = host_identity == "localhost";
+
+                let child_stdout = child.stdout.take();
+
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open(&output_path)
+                        .ok();
+
+                    if let Some(stdout) = child_stdout {
+                        let tx = tx.clone();
+                        let task_uuid_clone = task_uuid.clone();
+                        let mut reader = BufReader::new(stdout);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    if let Some(ref mut f) = file {
+                                        let _ = std::io::Write::write_all(f, line.as_bytes());
+                                    }
+                                    if !is_localhost {
+                                        ws_emit(&tx, "background_output", json!({
+                                            "task_uuid": task_uuid_clone,
+                                            "output_path": output_path.to_string_lossy(),
+                                            "line": line.trim_end(),
+                                        }));
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    let status = child.wait().await;
+                    let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                    let output_path_str = output_path.to_string_lossy().to_string();
+                    tracing::info!(task_uuid = %task_uuid, exit_code = code, "background task completed");
+                    ws_emit(&tx, "background_done", json!({
+                        "task_uuid": task_uuid,
+                        "exit_code": code,
+                        "output_path": output_path_str,
+                    }));
+                });
+            }
+            Err(e) => {
+                ws_emit(tx, "tool_result", json!({
+                    "call_id": call_id,
+                    "output": format!("failed to spawn background task: {}", e),
+                    "exit_code": 1,
+                }));
+            }
+        }
+        return;
+    }
 
     let output = if sandboxed {
         let config = read_sandbox_config(slug);
         let mut cmd = build_sandbox_command(command, &config);
+        cmd.env("RUNNING_UNDER_WICKET", "1");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.output().await
     } else {
         tracing::warn!(command = %command, "running unsandboxed");
         let mut cmd = tokio::process::Command::new("zsh");
+        cmd.env("RUNNING_UNDER_WICKET", "1");
         cmd.arg("-c").arg(command);
         cmd.output().await
     };
@@ -226,6 +339,7 @@ async fn handle_shell(tx: &WsSender, call_id: &str, data: Value) {
     tracing::info!(command = %command, "shell exec (unsandboxed)");
 
     let output = tokio::process::Command::new("zsh")
+        .env("RUNNING_UNDER_WICKET", "1")
         .arg("-c")
         .arg(command)
         .output()
@@ -418,13 +532,13 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let wicket_url = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("usage: smedly <wicket-ws-url> <slug> [host-identity]");
+        eprintln!("usage: wicket <wicket-ws-url> <slug> [host-identity]");
         std::process::exit(1);
     });
-    let slug = args.get(2).cloned().unwrap_or_else(|| "_smedly".to_string());
+    let slug = args.get(2).cloned().unwrap_or_else(|| "_wicket".to_string());
     let host_identity = args.get(3).cloned().unwrap_or_else(|| "localhost".to_string());
 
-    tracing::info!(url = %wicket_url, slug = %slug, host = %host_identity, "smedly starting");
+    tracing::info!(url = %wicket_url, slug = %slug, host = %host_identity, "wicket starting");
 
     let (ws_stream, _) = match tokio_tungstenite::connect_async(&wicket_url).await {
         Ok(s) => s,
@@ -439,7 +553,7 @@ async fn main() {
 
     let connect = json!({
         "slug": slug,
-        "protocol": "smedly",
+        "protocol": "wicket",
         "host": host_identity,
     });
     if ws_sink.send(Message::text(connect.to_string())).await.is_err() {
@@ -486,7 +600,7 @@ async fn main() {
 
                 match stream {
                     "zsh" => {
-                        handle_zsh(&ws_tx, slug, &call_id, data).await;
+                        handle_zsh(&ws_tx, slug, &call_id, &host_identity, data).await;
                     }
                     "shell" => {
                         handle_shell(&ws_tx, &call_id, data).await;
@@ -515,7 +629,7 @@ async fn main() {
         }
     }
 
-    tracing::info!("smedly shutting down");
+    tracing::info!("wicket shutting down");
 }
 
 fn gethostname() -> String {
