@@ -591,25 +591,85 @@ async fn main() {
 
                 let stream = envelope.get("stream").and_then(|v| v.as_str()).unwrap_or("");
                 let data = envelope.get("data").cloned().unwrap_or_default();
-                let call_id = data.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let msg_slug = envelope.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                let msg_timestamp = envelope.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
 
-                if let Some(s) = data.get("slug").and_then(|v| v.as_str()) {
-                    current_slug = Some(s.to_string());
+                if !msg_slug.is_empty() {
+                    current_slug = Some(msg_slug.to_string());
                 }
                 let slug = current_slug.as_deref().unwrap_or("default");
 
                 match stream {
-                    "zsh" => {
-                        handle_zsh(&ws_tx, slug, &call_id, &host_identity, data).await;
+                    "call" => {
+                        let who = data.get("who").and_then(|v| v.as_str()).unwrap_or("");
+                        let f = data.get("f").and_then(|v| v.as_str()).unwrap_or("");
+                        let call_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let args = data.get("args").cloned().unwrap_or_default();
+                        let escalated = data.get("escalated").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                        if who != "wicket" {
+                            continue;
+                        }
+
+                        let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
+                        if host != host_identity {
+                            continue;
+                        }
+
+                        tracing::info!(call_id = %call_id, f = %f, host = %host, "claimed call");
+
+                        match f {
+                            "zsh" => {
+                                let sandboxed = !escalated;
+                                let mut zsh_data = json!({
+                                    "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                    "sandboxed": sandboxed,
+                                    "run_in_background": args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false),
+                                    "timeout": args.get("timeout"),
+                                    "task_uuid": call_id,
+                                    "timestamp": msg_timestamp,
+                                });
+                                handle_zsh(&ws_tx, slug, &call_id, &host_identity, zsh_data).await;
+                            }
+                            "shell" => {
+                                let shell_data = json!({
+                                    "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
+                                });
+                                handle_shell(&ws_tx, &call_id, shell_data).await;
+                            }
+                            "apply_patch" => {
+                                let patch_data = json!({
+                                    "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
+                                });
+                                handle_apply_patch(&ws_tx, slug, &call_id, patch_data).await;
+                            }
+                            "view_image" => {
+                                let image_data = json!({
+                                    "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                                });
+                                handle_view_image(&ws_tx, &call_id, image_data).await;
+                            }
+                            _ => {
+                                tracing::debug!(f = %f, "unknown function");
+                                ws_emit(&ws_tx, "tool_result", json!({
+                                    "call_id": call_id,
+                                    "output": format!("unknown function: {}", f),
+                                    "exit_code": 1,
+                                }));
+                            }
+                        }
                     }
-                    "shell" => {
-                        handle_shell(&ws_tx, &call_id, data).await;
-                    }
-                    "apply_patch" => {
-                        handle_apply_patch(&ws_tx, slug, &call_id, data).await;
-                    }
-                    "view_image" => {
-                        handle_view_image(&ws_tx, &call_id, data).await;
+                    "tools_query" => {
+                        let query_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        ws_emit(&ws_tx, "tools_response", json!({
+                            "id": query_id,
+                            "tools": [
+                                { "who": "wicket", "f": "zsh", "description": "Execute a command in a sandboxed Zsh shell. Args: command (string), host (string, default localhost), run_in_background (bool), timeout (int ms), escalate (bool), reason (string)." },
+                                { "who": "wicket", "f": "apply_patch", "description": "Apply a structured diff patch to files. Args: patch (string), host (string, default localhost)." },
+                                { "who": "wicket", "f": "view_image", "description": "View an image file. Returns the image inline. Args: path (string), host (string, default localhost)." },
+                                { "who": "wicket", "f": "shell", "description": "Execute an unsandboxed shell command. Args: command (string), host (string, default localhost)." }
+                            ]
+                        }));
                     }
                     "shutdown" => {
                         tracing::info!("shutdown requested");
