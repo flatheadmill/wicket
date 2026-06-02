@@ -52,8 +52,8 @@ fn init_tracing() -> WorkerGuard {
 
 type WsSender = mpsc::UnboundedSender<String>;
 
-fn ws_emit(tx: &WsSender, stream: &str, data: Value) {
-    let envelope = json!({ "stream": stream, "data": data });
+fn ws_emit(tx: &WsSender, stream: &str, slug: &str, timestamp: &str, data: Value) {
+    let envelope = json!({ "stream": stream, "slug": slug, "timestamp": timestamp, "data": data });
     if let Ok(json) = serde_json::to_string(&envelope) {
         log_wire("_", "send", &json);
         let _ = tx.send(json);
@@ -178,7 +178,7 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
 
 // -- Tool handlers --
 
-async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &str, data: Value) {
+async fn handle_zsh(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, host_identity: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let sandboxed = data.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true);
     let run_bg = data.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -199,7 +199,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
         let file = match std::fs::File::create(&output_path) {
             Ok(f) => f,
             Err(e) => {
-                ws_emit(tx, "tool_result", json!({
+                ws_emit(tx, "tool_result", slug, timestamp, json!({
                     "call_id": call_id,
                     "output": format!("failed to create output file: {}", e),
                     "exit_code": 1,
@@ -225,7 +225,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
 
         match cmd.spawn() {
             Ok(mut child) => {
-                ws_emit(tx, "tool_result", json!({
+                ws_emit(tx, "tool_result", slug, timestamp, json!({
                     "call_id": call_id,
                     "output": format!("Background task {} started. Output: {}", task_uuid, output_path.display()),
                     "exit_code": 0,
@@ -235,6 +235,8 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                 let output_path = output_path.clone();
                 let task_uuid = task_uuid.to_string();
                 let is_localhost = host_identity == "localhost";
+                let bg_slug = slug.to_string();
+                let bg_timestamp = timestamp.to_string();
 
                 let child_stdout = child.stdout.take();
 
@@ -260,7 +262,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                                         let _ = std::io::Write::write_all(f, line.as_bytes());
                                     }
                                     if !is_localhost {
-                                        ws_emit(&tx, "background_output", json!({
+                                        ws_emit(&tx, "background_output", &bg_slug, &bg_timestamp, json!({
                                             "task_uuid": task_uuid_clone,
                                             "output_path": output_path.to_string_lossy(),
                                             "line": line.trim_end(),
@@ -276,7 +278,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                     let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                     let output_path_str = output_path.to_string_lossy().to_string();
                     tracing::info!(task_uuid = %task_uuid, exit_code = code, "background task completed");
-                    ws_emit(&tx, "background_done", json!({
+                    ws_emit(&tx, "background_done", &bg_slug, &bg_timestamp, json!({
                         "task_uuid": task_uuid,
                         "exit_code": code,
                         "output_path": output_path_str,
@@ -284,7 +286,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                 });
             }
             Err(e) => {
-                ws_emit(tx, "tool_result", json!({
+                ws_emit(tx, "tool_result", slug, timestamp, json!({
                     "call_id": call_id,
                     "output": format!("failed to spawn background task: {}", e),
                     "exit_code": 1,
@@ -318,14 +320,14 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                 format!("{}{}", stdout, stderr)
             };
             let code = out.status.code().unwrap_or(-1);
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "tool_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": combined,
                 "exit_code": code,
             }));
         }
         Err(e) => {
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "tool_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": format!("failed to execute: {}", e),
                 "exit_code": 1,
@@ -334,7 +336,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
     }
 }
 
-async fn handle_shell(tx: &WsSender, call_id: &str, data: Value) {
+async fn handle_shell(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
     tracing::info!(command = %command, "shell exec (unsandboxed)");
 
@@ -355,14 +357,14 @@ async fn handle_shell(tx: &WsSender, call_id: &str, data: Value) {
                 format!("{}{}", stdout, stderr)
             };
             let code = out.status.code().unwrap_or(-1);
-            ws_emit(tx, "shell_result", json!({
+            ws_emit(tx, "shell_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": combined,
                 "exit_code": code,
             }));
         }
         Err(e) => {
-            ws_emit(tx, "shell_result", json!({
+            ws_emit(tx, "shell_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": format!("failed to execute: {}", e),
                 "exit_code": 1,
@@ -371,7 +373,7 @@ async fn handle_shell(tx: &WsSender, call_id: &str, data: Value) {
     }
 }
 
-async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Value) {
+async fn handle_apply_patch(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, data: Value) {
     let patch = data.get("patch").and_then(|v| v.as_str()).unwrap_or("");
     tracing::info!("apply_patch request");
 
@@ -397,7 +399,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
             }
 
             if let Some(denied) = denied_path {
-                ws_emit(tx, "tool_result", json!({
+                ws_emit(tx, "tool_result", slug, timestamp, json!({
                     "call_id": call_id,
                     "output": format!("patch denied: {} is not inside a writable root", denied),
                     "exit_code": 1,
@@ -408,7 +410,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
                 match codex_apply_patch::apply_patch(patch, &mut stdout_buf, &mut stderr_buf) {
                     Ok(()) => {
                         let output = String::from_utf8_lossy(&stdout_buf);
-                        ws_emit(tx, "tool_result", json!({
+                        ws_emit(tx, "tool_result", slug, timestamp, json!({
                             "call_id": call_id,
                             "output": output.trim_end(),
                             "exit_code": 0,
@@ -421,7 +423,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
                         } else {
                             format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
                         };
-                        ws_emit(tx, "tool_result", json!({
+                        ws_emit(tx, "tool_result", slug, timestamp, json!({
                             "call_id": call_id,
                             "output": output,
                             "exit_code": 1,
@@ -431,7 +433,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
             }
         }
         Err(e) => {
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "tool_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": format!("patch parse error: {}", e),
                 "exit_code": 1,
@@ -440,7 +442,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
     }
 }
 
-async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
+async fn handle_view_image(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, data: Value) {
     let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
     tracing::info!(path = %path_str, "view_image");
 
@@ -454,7 +456,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     let file_bytes = match std::fs::read(&abs_path) {
         Ok(b) => b,
         Err(e) => {
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "tool_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": format!("cannot read image: {}", e),
                 "exit_code": 1,
@@ -466,7 +468,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     let img = match image::load_from_memory(&file_bytes) {
         Ok(i) => i,
         Err(e) => {
-            ws_emit(tx, "tool_result", json!({
+            ws_emit(tx, "tool_result", slug, timestamp, json!({
                 "call_id": call_id,
                 "output": format!("cannot decode image: {}", e),
                 "exit_code": 1,
@@ -517,7 +519,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         { "type": "image", "data": encoded, "mimeType": media_type }
     ]);
 
-    ws_emit(tx, "tool_result", json!({
+    ws_emit(tx, "tool_result", slug, timestamp, json!({
         "call_id": call_id,
         "output": serde_json::to_string(&content).unwrap_or_default(),
         "exit_code": 0,
@@ -551,15 +553,7 @@ async fn main() {
 
     let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
 
-    let connect = json!({
-        "slug": slug,
-        "protocol": "wicket",
-        "host": host_identity,
-    });
-    if ws_sink.send(Message::text(connect.to_string())).await.is_err() {
-        tracing::error!("failed to send connect payload");
-        std::process::exit(1);
-    }
+    // No connect payload. Wicket receives bus messages and claims by who="wicket".
 
     tracing::info!("connected to wicket");
 
@@ -574,12 +568,11 @@ async fn main() {
         let _ = ws_sink.close().await;
     });
 
-    let mut current_slug: Option<String> = None;
 
     while let Some(result) = ws_stream_rx.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                log_wire(current_slug.as_deref().unwrap_or("_"), "recv", &text);
+                log_wire("_", "recv", &text);
 
                 let envelope: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -589,69 +582,73 @@ async fn main() {
                     }
                 };
 
-                let stream = envelope.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                let stream = match envelope.get("stream").and_then(|v| v.as_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 let data = envelope.get("data").cloned().unwrap_or_default();
-                let msg_slug = envelope.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-                let msg_timestamp = envelope.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-
-                if !msg_slug.is_empty() {
-                    current_slug = Some(msg_slug.to_string());
-                }
-                let slug = current_slug.as_deref().unwrap_or("default");
 
                 match stream {
                     "call" => {
-                        let who = data.get("who").and_then(|v| v.as_str()).unwrap_or("");
-                        let f = data.get("f").and_then(|v| v.as_str()).unwrap_or("");
-                        let call_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let args = data.get("args").cloned().unwrap_or_default();
-                        let escalated = data.get("escalated").and_then(|v| v.as_bool()).unwrap_or(false);
-
+                        let who = match data.get("who").and_then(|v| v.as_str()) {
+                            Some(w) => w,
+                            None => continue,
+                        };
                         if who != "wicket" {
                             continue;
                         }
+
+                        let slug = envelope.get("slug").and_then(|v| v.as_str())
+                            .expect("call envelope missing slug");
+                        let timestamp = envelope.get("timestamp").and_then(|v| v.as_str())
+                            .expect("call envelope missing timestamp");
+                        let f = data.get("f").and_then(|v| v.as_str())
+                            .expect("call envelope missing f");
+                        let call_id = data.get("id").and_then(|v| v.as_str())
+                            .expect("call envelope missing id");
+                        let args = data.get("args").cloned().unwrap_or_default();
+                        let escalated = data.get("escalated").and_then(|v| v.as_bool()).unwrap_or(false);
 
                         let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("localhost");
                         if host != host_identity {
                             continue;
                         }
 
-                        tracing::info!(call_id = %call_id, f = %f, host = %host, "claimed call");
+                        tracing::info!(call_id = %call_id, f = %f, slug = %slug, "claimed call");
+                        let call_id = call_id.to_string();
 
                         match f {
                             "zsh" => {
-                                let sandboxed = !escalated;
-                                let mut zsh_data = json!({
+                                let zsh_data = json!({
                                     "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
-                                    "sandboxed": sandboxed,
+                                    "sandboxed": !escalated,
                                     "run_in_background": args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false),
                                     "timeout": args.get("timeout"),
                                     "task_uuid": call_id,
-                                    "timestamp": msg_timestamp,
+                                    "timestamp": timestamp,
                                 });
-                                handle_zsh(&ws_tx, slug, &call_id, &host_identity, zsh_data).await;
+                                handle_zsh(&ws_tx, slug, timestamp, &call_id, &host_identity, zsh_data).await;
                             }
                             "shell" => {
                                 let shell_data = json!({
                                     "command": args.get("command").and_then(|v| v.as_str()).unwrap_or(""),
                                 });
-                                handle_shell(&ws_tx, &call_id, shell_data).await;
+                                handle_shell(&ws_tx, slug, timestamp, &call_id, shell_data).await;
                             }
                             "apply_patch" => {
                                 let patch_data = json!({
                                     "patch": args.get("patch").and_then(|v| v.as_str()).unwrap_or(""),
                                 });
-                                handle_apply_patch(&ws_tx, slug, &call_id, patch_data).await;
+                                handle_apply_patch(&ws_tx, slug, timestamp, &call_id, patch_data).await;
                             }
                             "view_image" => {
                                 let image_data = json!({
                                     "path": args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
                                 });
-                                handle_view_image(&ws_tx, &call_id, image_data).await;
+                                handle_view_image(&ws_tx, slug, timestamp, &call_id, image_data).await;
                             }
                             _ => {
-                                tracing::debug!(f = %f, "unknown function");
-                                ws_emit(&ws_tx, "tool_result", json!({
+                                ws_emit(&ws_tx, "tool_result", slug, timestamp, json!({
                                     "call_id": call_id,
                                     "output": format!("unknown function: {}", f),
                                     "exit_code": 1,
@@ -660,8 +657,9 @@ async fn main() {
                         }
                     }
                     "tools_query" => {
-                        let query_id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        ws_emit(&ws_tx, "tools_response", json!({
+                        let query_id = data.get("id").and_then(|v| v.as_str())
+                            .expect("tools_query missing id");
+                        ws_emit(&ws_tx, "tools_response", "", "", json!({
                             "id": query_id,
                             "tools": [
                                 { "who": "wicket", "f": "zsh", "description": "Execute a command in a sandboxed Zsh shell. Args: command (string), host (string, default localhost), run_in_background (bool), timeout (int ms), escalate (bool), reason (string)." },
