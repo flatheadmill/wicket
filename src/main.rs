@@ -565,7 +565,13 @@ async fn main() {
 
     // No connect payload. Wicket receives bus messages and claims by who="wicket".
 
-    tracing::info!("connected to wicket");
+    // Identify ourselves to Easement so the Wicket manager tracks our connection.
+    let connect_msg = json!({ "slug": slug, "protocol": "wicket", "host": host_identity });
+    if let Ok(json) = serde_json::to_string(&connect_msg) {
+        let _ = ws_sink.send(Message::text(json)).await;
+    }
+
+    tracing::info!("connected and identified");
 
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
 
