@@ -27,11 +27,21 @@ fn init_tracing() -> WorkerGuard {
         .join("wicket");
     let _ = std::fs::create_dir_all(&log_dir);
 
+    let port: u16 = std::env::var("EASEMENT_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6502);
+    let log_name = if port == 6502 {
+        "wicket.log".to_string()
+    } else {
+        format!("wicket-{}.log", port)
+    };
+
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join("wicket.log"))
-        .expect("failed to open wicket.log");
+        .open(log_dir.join(&log_name))
+        .expect("failed to open log file");
 
     let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
