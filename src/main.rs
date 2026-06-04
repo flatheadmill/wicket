@@ -188,7 +188,7 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
 
 // -- Tool handlers --
 
-async fn handle_zsh(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, host_identity: &str, data: Value) {
+async fn handle_zsh(tx: &WsSender, slug: &str, _timestamp: &str, call_id: &str, host_identity: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let sandboxed = data.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true);
     let run_bg = data.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -206,7 +206,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, h
         let _ = std::fs::create_dir_all(&output_dir);
         let output_path = output_dir.join(format!("{}.txt", task_uuid));
 
-        let file = match std::fs::File::create(&output_path) {
+        let _file = match std::fs::File::create(&output_path) {
             Ok(f) => f,
             Err(e) => {
                 ws_emit(tx, "tool_result", slug, timestamp, json!({
@@ -217,8 +217,8 @@ async fn handle_zsh(tx: &WsSender, slug: &str, timestamp: &str, call_id: &str, h
                 return;
             }
         };
-        let stdout_file = file.try_clone().unwrap();
-        let stderr_file = file;
+
+
 
         let mut cmd = if sandboxed {
             let config = read_sandbox_config(slug);
@@ -704,20 +704,4 @@ async fn main() {
     }
 
     tracing::info!("wicket shutting down");
-}
-
-fn gethostname() -> String {
-    #[cfg(unix)]
-    {
-        use std::ffi::CStr;
-        let mut buf = [0u8; 256];
-        unsafe {
-            if libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) == 0 {
-                return CStr::from_ptr(buf.as_ptr() as *const _)
-                    .to_string_lossy()
-                    .to_string();
-            }
-        }
-    }
-    "unknown".to_string()
 }
