@@ -131,7 +131,6 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
     policy.push_str("(allow process-fork)\n");
     policy.push_str("(allow signal (target same-sandbox))\n");
     policy.push_str("(allow process-info* (target same-sandbox))\n");
-    policy.push_str("(allow process-info-setpriority)\n");
     policy.push_str("(allow file-read*)\n");
     for path in &config.writable {
         policy.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", path));
