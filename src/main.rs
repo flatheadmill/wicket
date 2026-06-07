@@ -574,7 +574,17 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
 }
 
 
-// Inbound: what Easement sends to Wicket.
+// The envelope protocol between Easement and Wicket is strict. Every field is
+// required. No Option unless the absence is a real state (e.g. timeout not
+// set). A missing field is a serialization bug, not a condition to handle at
+// runtime.
+//
+// The ToolCall variants are the exception. Their fields are function arguments
+// that Claude fills in through tool descriptions. Additive booleans like
+// run_in_background and escalate default to false via #[serde(default)]
+// because the caller only mentions them when opting in. This is a user
+// interface, not a wire protocol.
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "what", rename_all = "snake_case")]
 enum Inbound {
@@ -700,7 +710,7 @@ async fn main() {
         tools: vec![
             ToolDef {
                 f: "zsh".to_string(),
-                description: "Execute a command in a sandboxed Zsh shell. The command runs inside a deny-default sandbox with full read and restricted write. Args: command (string, required), where (string, required — the host identity, e.g. \"localhost\"), run_in_background (bool, optional — returns immediately with a task ID, notifies on completion), timeout (int ms, optional), escalate (bool, optional — requests operator approval to run unsandboxed).".to_string(),
+                description: "Execute a command in a sandboxed Zsh shell. The command runs inside a deny-default sandbox with full read and restricted write. Args: command (string, required), where (string, required, the host identity e.g. \"localhost\"), run_in_background (bool, default false, returns immediately with a task ID and notifies on completion), timeout (int ms, optional), escalate (bool, default false, requests operator approval to run unsandboxed).".to_string(),
             },
             ToolDef {
                 f: "apply_patch".to_string(),
