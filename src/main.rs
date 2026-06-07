@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Clone, Serialize)]
 struct LogMessage {
     when: String,
+    level: u8,
     who: &'static str,
     what: &'static str,
     why: &'static str,
@@ -35,20 +36,44 @@ struct LogEntry {
 
 static LOG: OnceLock<broadcast::Sender<LogMessage>> = OnceLock::new();
 
-fn log(msg: LogMessage) {
+fn log(level: u8, msg: LogMessage) {
     if let Some(tx) = LOG.get() {
-        let _ = tx.send(msg);
+        let _ = tx.send(LogMessage { level, ..msg });
     }
 }
 
-macro_rules! log {
+macro_rules! trace {
     ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(LogMessage {
-            when: now(),
-            who: $who,
-            what: $what,
-            why: $why,
+        crate::log(0, LogMessage {
+            when: now(), level: 0, who: $who, what: $what, why: $why,
             payload: serde_json::json!({ $($key: $val),* }),
+        })
+    };
+}
+
+macro_rules! wire {
+    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
+        crate::log(1, LogMessage {
+            when: now(), level: 1, who: $who, what: $what, why: $why,
+            payload: serde_json::json!({ $($key: $val),* }),
+        })
+    };
+}
+
+macro_rules! dump {
+    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
+        crate::log(2, LogMessage {
+            when: now(), level: 2, who: $who, what: $what, why: $why,
+            payload: serde_json::json!({ $($key: $val),* }),
+        })
+    };
+}
+
+macro_rules! error {
+    ($who:expr, $what:expr, $how:expr, $error:expr $(, $key:tt: $val:expr)* $(,)?) => {
+        crate::log(0, LogMessage {
+            when: now(), level: 0, who: $who, what: $what, why: "error",
+            payload: serde_json::json!({ "how": $how, "error": $error.to_string() $(, $key: $val)* }),
         })
     };
 }
@@ -98,7 +123,7 @@ async fn init_log(host_identity: &str) {
                     let shed = LogEntry {
                         when: now(),
                         what: LogMessage {
-                            when: now(), who: "log", what: "lifecycle", why: "shed",
+                            when: now(), level: 0, who: "log", what: "lifecycle", why: "shed",
                             payload: json!({ "count": n }),
                         },
                     };
@@ -227,7 +252,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
     let run_bg = data.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
     let transcript = data.get("transcript").and_then(|v| v.as_str()).unwrap_or("default");
     let task_uuid = data.get("task_uuid").and_then(|v| v.as_str()).unwrap_or("");
-    log!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
+    trace!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
 
     if run_bg {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -318,7 +343,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                     let status = child.wait().await;
                     let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                     let output_path_str = output_path.to_string_lossy().to_string();
-                    log!("wicket", "tool", "background_done", "task_uuid": task_uuid, "exit_code": code);
+                    trace!("wicket", "tool", "background_done", "task_uuid": task_uuid, "exit_code": code);
                     send(&tx, Outbound::Tool(ToolOutbound::BackgroundDone {
                         task_uuid,
                         exit_code: code,
@@ -344,7 +369,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.output().await
     } else {
-        log!("wicket", "tool", "unsandboxed", "command": command);
+        trace!("wicket", "tool", "unsandboxed", "command": command);
         let mut cmd = tokio::process::Command::new("zsh");
         cmd.env("RUNNING_UNDER_WICKET", "1");
         cmd.arg("-c").arg(command);
@@ -381,7 +406,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
 // in the tools manifest. Claude cannot discover or call it.
 async fn handle_shell(tx: &WsSender, slug: &str, transcript: &str, call_id: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
-    log!("wicket", "shell", "exec", "command": command);
+    trace!("wicket", "shell", "exec", "command": command);
 
     let output = tokio::process::Command::new("zsh")
         .env("RUNNING_UNDER_WICKET", "1")
@@ -425,7 +450,7 @@ async fn handle_shell(tx: &WsSender, slug: &str, transcript: &str, call_id: &str
 // too, but checking first gives a clear error instead of a cryptic seatbelt denial.
 async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Value) {
     let patch = data.get("patch").and_then(|v| v.as_str()).unwrap_or("");
-    log!("wicket", "tool", "apply_patch");
+    trace!("wicket", "tool", "apply_patch");
 
     let sandbox_config = read_sandbox_config(slug);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -497,7 +522,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
 // Preserves source format when possible, falls back to JPEG on resize.
 async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    log!("wicket", "tool", "view_image", "path": path_str);
+    trace!("wicket", "tool", "view_image", "path": path_str);
 
     let path = Path::new(path_str);
     let abs_path = if path.is_absolute() {
@@ -539,7 +564,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         let (rw, rh) = (resized.width(), resized.height());
         let mut buf = std::io::Cursor::new(Vec::new());
         resized.write_to(&mut buf, image::ImageFormat::Jpeg)
-            .unwrap_or_else(|e| log!("wicket", "tool", "jpeg_encode_failed", "error": e.to_string()));
+            .unwrap_or_else(|e| error!("wicket", "tool", "jpeg_encode_failed", e));
         (buf.into_inner(), rw, rh, "image/jpeg")
     } else {
         let ext = abs_path.extension()
@@ -556,7 +581,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         (file_bytes, w, h, media_type)
     };
 
-    log!("wicket", "tool", "view_image_encoded", "original": format!("{}x{}", w, h), "output": format!("{}x{}", output_w, output_h), "resized": needs_resize, "bytes": output_bytes.len());
+    trace!("wicket", "tool", "view_image_encoded", "original": format!("{}x{}", w, h), "output": format!("{}x{}", output_w, output_h), "resized": needs_resize, "bytes": output_bytes.len());
 
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&output_bytes);
@@ -663,8 +688,12 @@ enum ShellOutbound {
 }
 
 fn send(tx: &WsSender, msg: Outbound) {
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = tx.send(json);
+    match serde_json::to_string(&msg) {
+        Ok(json) => {
+            wire!("wicket", "websocket", "send", "raw": json);
+            let _ = tx.send(json);
+        }
+        Err(e) => error!("wicket", "websocket", "serialize", e),
     }
 }
 
@@ -679,12 +708,12 @@ async fn main() {
     let host_identity = args.get(2).cloned().unwrap_or_else(|| "localhost".to_string());
 
     init_log(&host_identity).await;
-    log!("wicket", "lifecycle", "starting", "url": wicket_url, "where": host_identity);
+    trace!("wicket", "lifecycle", "starting", "url": wicket_url, "where": host_identity);
 
     let (ws_stream, _) = match tokio_tungstenite::connect_async(&wicket_url).await {
         Ok(s) => s,
         Err(e) => {
-            log!("wicket", "lifecycle", "connect_failed", "error": e.to_string());
+            error!("wicket", "lifecycle", "connect_failed", e);
             eprintln!("cannot connect to easement: {}", e);
             std::process::exit(1);
         }
@@ -722,16 +751,33 @@ async fn main() {
             },
         ],
     }));
-    log!("wicket", "lifecycle", "connected");
+    trace!("wicket", "lifecycle", "connected");
 
     while let Some(result) = ws_stream_rx.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                log!("wicket", "websocket", "recv", "raw": text);
+                let raw: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("wicket", "websocket", "parse_json", e, "raw": text);
+                        continue;
+                    }
+                };
 
-                let msg: Inbound = match serde_json::from_str(&text) {
+                let what = raw.get("what").and_then(|v| v.as_str()).unwrap_or("");
+                if what == "tool" || what == "shell" {
+                    wire!("wicket", "websocket", "recv", "raw": raw);
+                } else {
+                    dump!("wicket", "websocket", "ignored", "raw": raw);
+                    continue;
+                }
+
+                let msg: Inbound = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
-                    Err(_) => continue,
+                    Err(e) => {
+                        error!("wicket", "websocket", "decode", e, "raw": raw);
+                        continue;
+                    }
                 };
 
                 match msg {
@@ -744,7 +790,7 @@ async fn main() {
                         if tool_where != &host_identity {
                             continue;
                         }
-                        log!("wicket", "tool", "run", "call_id": call_id);
+                        trace!("wicket", "tool", "run", "call_id": call_id);
 
                         match tool {
                             ToolCall::Zsh { command, run_in_background, timeout, escalate, .. } => {
@@ -772,7 +818,7 @@ async fn main() {
                         if r#where != host_identity {
                             continue;
                         }
-                        log!("wicket", "shell", "run", "id": id, "command": command);
+                        trace!("wicket", "shell", "run", "id": id, "command": command);
                         let shell_data = json!({ "command": command });
                         handle_shell(&ws_tx, &slug, &transcript, &id, shell_data).await;
                     }
@@ -780,12 +826,12 @@ async fn main() {
             }
             Ok(Message::Close(_)) => break,
             Err(e) => {
-                log!("wicket", "websocket", "error", "error": e.to_string());
+                error!("wicket", "websocket", "read", e);
                 break;
             }
             _ => {}
         }
     }
 
-    log!("wicket", "lifecycle", "shutdown");
+    trace!("wicket", "lifecycle", "shutdown");
 }
