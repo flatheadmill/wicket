@@ -9,12 +9,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Clone, Serialize)]
@@ -82,6 +82,62 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn home_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+}
+
+fn pane_dir(slug: &str) -> PathBuf {
+    home_dir().join("pane").join(slug)
+}
+
+fn wicket_state_dir(slug: &str) -> PathBuf {
+    home_dir().join(".local/state/wicket").join(slug)
+}
+
+fn job_dir(slug: &str, host_identity: &str) -> PathBuf {
+    wicket_state_dir(slug).join("jobs").join(host_identity)
+}
+
+fn running_job_path(slug: &str, host_identity: &str, job_id: &str) -> PathBuf {
+    job_dir(slug, host_identity).join(format!("{}.running.job", job_id))
+}
+
+fn finished_job_path(slug: &str, host_identity: &str, job_id: &str, exit_code: i32) -> PathBuf {
+    job_dir(slug, host_identity).join(format!("{}.{}.job", job_id, exit_code))
+}
+
+async fn find_job_path(
+    slug: &str,
+    host_identity: &str,
+    job_id: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let dir = job_dir(slug, host_identity);
+    let running = dir.join(format!("{}.running.job", job_id));
+    if tokio::fs::try_exists(&running).await? {
+        return Ok(Some(running));
+    }
+
+    let prefix = format!("{}.", job_id);
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with(&prefix) && file_name.ends_with(".job") {
+            return Ok(Some(entry.path()));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn ensure_pane_dir(slug: &str) -> std::io::Result<PathBuf> {
+    let dir = pane_dir(slug);
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
 // Wicket is spawned with null stdio so logs write to a JSONL file. The broadcast
 // channel sheds load if the sink falls behind and reports how many were dropped.
 async fn init_log(host_identity: &str) {
@@ -113,7 +169,10 @@ async fn init_log(host_identity: &str) {
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    let entry = LogEntry { when: now(), what: msg };
+                    let entry = LogEntry {
+                        when: now(),
+                        what: msg,
+                    };
                     if let Ok(mut line) = serde_json::to_string(&entry) {
                         line.push('\n');
                         let _ = file.write_all(line.as_bytes()).await;
@@ -123,7 +182,11 @@ async fn init_log(host_identity: &str) {
                     let shed = LogEntry {
                         when: now(),
                         what: LogMessage {
-                            when: now(), level: 0, who: "log", what: "lifecycle", why: "shed",
+                            when: now(),
+                            level: 0,
+                            who: "log",
+                            what: "lifecycle",
+                            why: "shed",
                             payload: json!({ "count": n }),
                         },
                     };
@@ -138,11 +201,7 @@ async fn init_log(host_identity: &str) {
     });
 }
 
-
 type WsSender = mpsc::UnboundedSender<String>;
-
-
-
 
 // The sandbox is the permission system. Every zsh command runs inside seatbelt (macOS)
 // or bubblewrap (Linux) with deny-default, full read, and write only to paths listed in
@@ -152,16 +211,13 @@ struct SandboxConfig {
     writable: Vec<String>,
 }
 
-fn read_sandbox_config(slug: &str) -> SandboxConfig {
+async fn read_sandbox_config(slug: &str) -> SandboxConfig {
     let home = std::env::var("HOME").unwrap_or_default();
-    let path = Path::new(&home)
-        .join(".local/state/wicket")
-        .join(slug)
-        .join("sandbox.conf");
+    let path = wicket_state_dir(slug).join("sandbox.conf");
 
-    let mut writable = Vec::new();
+    let mut writable = vec![pane_dir(slug).to_string_lossy().to_string()];
 
-    if let Ok(content) = std::fs::read_to_string(&path) {
+    if let Ok(content) = tokio::fs::read_to_string(&path).await {
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -211,7 +267,12 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
     policy.push_str("(allow user-preference-read)\n");
 
     let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
-    cmd.arg("-p").arg(&policy).arg("--").arg("zsh").arg("-c").arg(command);
+    cmd.arg("-p")
+        .arg(&policy)
+        .arg("--")
+        .arg("zsh")
+        .arg("-c")
+        .arg(command);
     cmd
 }
 
@@ -220,10 +281,15 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
     let mut args = vec![
         "--new-session".to_string(),
         "--die-with-parent".to_string(),
-        "--ro-bind".to_string(), "/".to_string(), "/".to_string(),
-        "--dev".to_string(), "/dev".to_string(),
-        "--proc".to_string(), "/proc".to_string(),
-        "--tmpfs".to_string(), "/tmp".to_string(),
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
         "--unshare-pid".to_string(),
     ];
     for path in &config.writable {
@@ -241,6 +307,44 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
     cmd
 }
 
+async fn append_job_stream<R>(
+    stream: R,
+    file: Arc<Mutex<tokio::fs::File>>,
+    tx: WsSender,
+    job_id: String,
+    output_path: PathBuf,
+    is_localhost: bool,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                {
+                    let mut file = file.lock().await;
+                    let _ = file.write_all(line.as_bytes()).await;
+                }
+                if !is_localhost {
+                    send(
+                        &tx,
+                        Outbound::Tool(ToolOutbound::BackgroundOutput {
+                            job_id: job_id.clone(),
+                            output_path: output_path.to_string_lossy().to_string(),
+                            line: line.trim_end().to_string(),
+                        }),
+                    );
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
 
 // Sandboxed shell. Runs inside seatbelt or bubblewrap. Supports foreground (wait for
 // output) and background (spawn, return immediately, notify when done). Background tasks
@@ -248,38 +352,54 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
 // a task notification on the next turn.
 async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
-    let sandboxed = data.get("sandboxed").and_then(|v| v.as_bool()).unwrap_or(true);
-    let run_bg = data.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
-    let transcript = data.get("transcript").and_then(|v| v.as_str()).unwrap_or("default");
-    let task_uuid = data.get("task_uuid").and_then(|v| v.as_str()).unwrap_or("");
+    let sandboxed = data
+        .get("sandboxed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let run_bg = data
+        .get("run_in_background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let job_id = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
     trace!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
 
-    if run_bg {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let output_dir = Path::new(&home)
-            .join(".local/state/wicket")
-            .join(slug)
-            .join(transcript)
-            .join(host_identity);
-        let _ = std::fs::create_dir_all(&output_dir);
-        let output_path = output_dir.join(format!("{}.txt", task_uuid));
+    let cwd = match ensure_pane_dir(slug).await {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("failed to create pane directory: {}", e),
+                    exit_code: 1,
+                }),
+            );
+            return;
+        }
+    };
 
-        let _file = match std::fs::File::create(&output_path) {
+    if run_bg {
+        let output_dir = job_dir(slug, host_identity);
+        let _ = tokio::fs::create_dir_all(&output_dir).await;
+        let output_path = running_job_path(slug, host_identity, job_id);
+
+        let file = match tokio::fs::File::create(&output_path).await {
             Ok(f) => f,
             Err(e) => {
-                send(tx, Outbound::Tool(ToolOutbound::Response {
-                    call_id: call_id.to_string(),
-                    output: format!("failed to create output file: {}", e),
-                    exit_code: 1,
-                }));
+                send(
+                    tx,
+                    Outbound::Tool(ToolOutbound::Response {
+                        call_id: call_id.to_string(),
+                        output: format!("failed to create output file: {}", e),
+                        exit_code: 1,
+                    }),
+                );
                 return;
             }
         };
 
-
-
         let mut cmd = if sandboxed {
-            let config = read_sandbox_config(slug);
+            let config = read_sandbox_config(slug).await;
             let mut c = build_sandbox_command(command, &config);
             c.env("RUNNING_UNDER_WICKET", "1");
             c
@@ -289,89 +409,110 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
             c.arg("-c").arg(command);
             c
         };
+        cmd.current_dir(&cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         match cmd.spawn() {
             Ok(mut child) => {
-                send(tx, Outbound::Tool(ToolOutbound::Response {
-                    call_id: call_id.to_string(),
-                    output: format!("Background task {} started. Output: {}", task_uuid, output_path.display()),
-                    exit_code: 0,
-                }));
+                send(
+                    tx,
+                    Outbound::Tool(ToolOutbound::Response {
+                        call_id: call_id.to_string(),
+                        output: format!(
+                            "Background job {} started. Output: {}",
+                            job_id,
+                            output_path.display()
+                        ),
+                        exit_code: 0,
+                    }),
+                );
 
                 let tx = tx.clone();
                 let output_path = output_path.clone();
-                let task_uuid = task_uuid.to_string();
+                let slug = slug.to_string();
+                let host_identity = host_identity.to_string();
+                let job_id = job_id.to_string();
                 let is_localhost = host_identity == "localhost";
+                let file = Arc::new(Mutex::new(file));
 
                 let child_stdout = child.stdout.take();
+                let child_stderr = child.stderr.take();
 
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncBufReadExt, BufReader};
-
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open(&output_path)
-                        .ok();
-
+                    let mut stream_tasks = Vec::new();
                     if let Some(stdout) = child_stdout {
-                        let tx = tx.clone();
-                        let task_uuid_clone = task_uuid.clone();
-                        let mut reader = BufReader::new(stdout);
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            match reader.read_line(&mut line).await {
-                                Ok(0) => break,
-                                Ok(_) => {
-                                    if let Some(ref mut f) = file {
-                                        let _ = std::io::Write::write_all(f, line.as_bytes());
-                                    }
-                                    if !is_localhost {
-                                        send(&tx, Outbound::Tool(ToolOutbound::BackgroundOutput {
-                                            task_uuid: task_uuid_clone.clone(),
-                                            output_path: output_path.to_string_lossy().to_string(),
-                                            line: line.trim_end().to_string(),
-                                        }));
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
+                        stream_tasks.push(tokio::spawn(append_job_stream(
+                            stdout,
+                            file.clone(),
+                            tx.clone(),
+                            job_id.clone(),
+                            output_path.clone(),
+                            is_localhost,
+                        )));
+                    }
+                    if let Some(stderr) = child_stderr {
+                        stream_tasks.push(tokio::spawn(append_job_stream(
+                            stderr,
+                            file.clone(),
+                            tx.clone(),
+                            job_id.clone(),
+                            output_path.clone(),
+                            is_localhost,
+                        )));
                     }
 
                     let status = child.wait().await;
+                    for task in stream_tasks {
+                        let _ = task.await;
+                    }
                     let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                    let output_path_str = output_path.to_string_lossy().to_string();
-                    trace!("wicket", "tool", "background_done", "task_uuid": task_uuid, "exit_code": code);
-                    send(&tx, Outbound::Tool(ToolOutbound::BackgroundDone {
-                        task_uuid,
-                        exit_code: code,
-                        output_path: output_path_str,
-                    }));
+                    drop(file);
+                    let finished_path = finished_job_path(&slug, &host_identity, &job_id, code);
+                    let final_path = match tokio::fs::rename(&output_path, &finished_path).await {
+                        Ok(()) => finished_path,
+                        Err(e) => {
+                            error!("wicket", "tool", "job_rename", e, "job_id": job_id);
+                            output_path
+                        }
+                    };
+                    let output_path_str = final_path.to_string_lossy().to_string();
+                    trace!("wicket", "tool", "background_done", "job_id": job_id, "exit_code": code);
+                    send(
+                        &tx,
+                        Outbound::Tool(ToolOutbound::BackgroundDone {
+                            job_id,
+                            exit_code: code,
+                            output_path: output_path_str,
+                        }),
+                    );
                 });
             }
             Err(e) => {
-                send(tx, Outbound::Tool(ToolOutbound::Response {
-                    call_id: call_id.to_string(),
-                    output: format!("failed to spawn background task: {}", e),
-                    exit_code: 1,
-                }));
+                send(
+                    tx,
+                    Outbound::Tool(ToolOutbound::Response {
+                        call_id: call_id.to_string(),
+                        output: format!("failed to spawn background task: {}", e),
+                        exit_code: 1,
+                    }),
+                );
             }
         }
         return;
     }
 
     let output = if sandboxed {
-        let config = read_sandbox_config(slug);
+        let config = read_sandbox_config(slug).await;
         let mut cmd = build_sandbox_command(command, &config);
         cmd.env("RUNNING_UNDER_WICKET", "1");
+        cmd.current_dir(&cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.output().await
     } else {
         trace!("wicket", "tool", "unsandboxed", "command": command);
         let mut cmd = tokio::process::Command::new("zsh");
         cmd.env("RUNNING_UNDER_WICKET", "1");
+        cmd.current_dir(&cwd);
         cmd.arg("-c").arg(command);
         cmd.output().await
     };
@@ -386,18 +527,24 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                 format!("{}{}", stdout, stderr)
             };
             let code = out.status.code().unwrap_or(-1);
-            send(tx, Outbound::Tool(ToolOutbound::Response {
-                call_id: call_id.to_string(),
-                output: combined,
-                exit_code: code,
-            }));
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: combined,
+                    exit_code: code,
+                }),
+            );
         }
         Err(e) => {
-            send(tx, Outbound::Tool(ToolOutbound::Response {
-                call_id: call_id.to_string(),
-                output: format!("failed to execute: {}", e),
-                exit_code: 1,
-            }));
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("failed to execute: {}", e),
+                    exit_code: 1,
+                }),
+            );
         }
     }
 }
@@ -408,8 +555,26 @@ async fn handle_shell(tx: &WsSender, slug: &str, transcript: &str, call_id: &str
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
     trace!("wicket", "shell", "exec", "command": command);
 
+    let cwd = match ensure_pane_dir(slug).await {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Shell(ShellOutbound::Response {
+                    id: call_id.to_string(),
+                    slug: slug.to_string(),
+                    transcript: transcript.to_string(),
+                    output: format!("failed to create pane directory: {}", e),
+                    exit_code: 1,
+                }),
+            );
+            return;
+        }
+    };
+
     let output = tokio::process::Command::new("zsh")
         .env("RUNNING_UNDER_WICKET", "1")
+        .current_dir(&cwd)
         .arg("-c")
         .arg(command)
         .output()
@@ -425,22 +590,79 @@ async fn handle_shell(tx: &WsSender, slug: &str, transcript: &str, call_id: &str
                 format!("{}{}", stdout, stderr)
             };
             let code = out.status.code().unwrap_or(-1);
-            send(tx, Outbound::Shell(ShellOutbound::Response {
-                id: call_id.to_string(),
-                slug: slug.to_string(),
-                transcript: transcript.to_string(),
-                output: combined,
-                exit_code: code,
-            }));
+            send(
+                tx,
+                Outbound::Shell(ShellOutbound::Response {
+                    id: call_id.to_string(),
+                    slug: slug.to_string(),
+                    transcript: transcript.to_string(),
+                    output: combined,
+                    exit_code: code,
+                }),
+            );
         }
         Err(e) => {
-            send(tx, Outbound::Shell(ShellOutbound::Response {
-                id: call_id.to_string(),
-                slug: slug.to_string(),
-                transcript: transcript.to_string(),
-                output: format!("failed to execute: {}", e),
-                exit_code: 1,
-            }));
+            send(
+                tx,
+                Outbound::Shell(ShellOutbound::Response {
+                    id: call_id.to_string(),
+                    slug: slug.to_string(),
+                    transcript: transcript.to_string(),
+                    output: format!("failed to execute: {}", e),
+                    exit_code: 1,
+                }),
+            );
+        }
+    }
+}
+
+async fn handle_job(tx: &WsSender, slug: &str, call_id: &str, host_identity: &str, job_id: &str) {
+    let path = match find_job_path(slug, host_identity, job_id).await {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("job {} not found on {}", job_id, host_identity),
+                    exit_code: 1,
+                }),
+            );
+            return;
+        }
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("failed to find job {}: {}", job_id, e),
+                    exit_code: 1,
+                }),
+            );
+            return;
+        }
+    };
+
+    match tokio::fs::read_to_string(&path).await {
+        Ok(output) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("job {} output at {}\n\n{}", job_id, path.display(), output),
+                    exit_code: 0,
+                }),
+            );
+        }
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("failed to read job {}: {}", job_id, e),
+                    exit_code: 1,
+                }),
+            );
         }
     }
 }
@@ -452,7 +674,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
     let patch = data.get("patch").and_then(|v| v.as_str()).unwrap_or("");
     trace!("wicket", "tool", "apply_patch");
 
-    let sandbox_config = read_sandbox_config(slug);
+    let sandbox_config = read_sandbox_config(slug).await;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     match codex_apply_patch::parse_patch(patch) {
@@ -465,7 +687,9 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
                     codex_apply_patch::Hunk::UpdateFile { path, .. } => path,
                 };
                 let abs = cwd.join(path).to_string_lossy().to_string();
-                let is_writable = sandbox_config.writable.iter()
+                let is_writable = sandbox_config
+                    .writable
+                    .iter()
                     .any(|root| abs.starts_with(root));
                 if !is_writable {
                     denied_path = Some(abs);
@@ -474,22 +698,28 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
             }
 
             if let Some(denied) = denied_path {
-                send(tx, Outbound::Tool(ToolOutbound::Response {
-                    call_id: call_id.to_string(),
-                    output: format!("patch denied: {} is not inside a writable root", denied),
-                    exit_code: 1,
-                }));
+                send(
+                    tx,
+                    Outbound::Tool(ToolOutbound::Response {
+                        call_id: call_id.to_string(),
+                        output: format!("patch denied: {} is not inside a writable root", denied),
+                        exit_code: 1,
+                    }),
+                );
             } else {
                 let mut stdout_buf = Vec::new();
                 let mut stderr_buf = Vec::new();
                 match codex_apply_patch::apply_patch(patch, &mut stdout_buf, &mut stderr_buf) {
                     Ok(()) => {
                         let output = String::from_utf8_lossy(&stdout_buf);
-                        send(tx, Outbound::Tool(ToolOutbound::Response {
-                            call_id: call_id.to_string(),
-                            output: output.trim_end().to_string(),
-                            exit_code: 0,
-                        }));
+                        send(
+                            tx,
+                            Outbound::Tool(ToolOutbound::Response {
+                                call_id: call_id.to_string(),
+                                output: output.trim_end().to_string(),
+                                exit_code: 0,
+                            }),
+                        );
                     }
                     Err(e) => {
                         let stderr_str = String::from_utf8_lossy(&stderr_buf);
@@ -498,21 +728,27 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
                         } else {
                             format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
                         };
-                        send(tx, Outbound::Tool(ToolOutbound::Response {
-                            call_id: call_id.to_string(),
-                            output,
-                            exit_code: 1,
-                        }));
+                        send(
+                            tx,
+                            Outbound::Tool(ToolOutbound::Response {
+                                call_id: call_id.to_string(),
+                                output,
+                                exit_code: 1,
+                            }),
+                        );
                     }
                 }
             }
         }
         Err(e) => {
-            send(tx, Outbound::Tool(ToolOutbound::Response {
-                call_id: call_id.to_string(),
-                output: format!("patch parse error: {}", e),
-                exit_code: 1,
-            }));
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("patch parse error: {}", e),
+                    exit_code: 1,
+                }),
+            );
         }
     }
 }
@@ -531,14 +767,17 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         std::env::current_dir().unwrap_or_default().join(path)
     };
 
-    let file_bytes = match std::fs::read(&abs_path) {
+    let file_bytes = match tokio::fs::read(&abs_path).await {
         Ok(b) => b,
         Err(e) => {
-            send(tx, Outbound::Tool(ToolOutbound::Response {
-                call_id: call_id.to_string(),
-                output: format!("cannot read image: {}", e),
-                exit_code: 1,
-            }));
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("cannot read image: {}", e),
+                    exit_code: 1,
+                }),
+            );
             return;
         }
     };
@@ -546,11 +785,14 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     let img = match image::load_from_memory(&file_bytes) {
         Ok(i) => i,
         Err(e) => {
-            send(tx, Outbound::Tool(ToolOutbound::Response {
-                call_id: call_id.to_string(),
-                output: format!("cannot decode image: {}", e),
-                exit_code: 1,
-            }));
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("cannot decode image: {}", e),
+                    exit_code: 1,
+                }),
+            );
             return;
         }
     };
@@ -563,11 +805,13 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         let resized = img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Triangle);
         let (rw, rh) = (resized.width(), resized.height());
         let mut buf = std::io::Cursor::new(Vec::new());
-        resized.write_to(&mut buf, image::ImageFormat::Jpeg)
+        resized
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
             .unwrap_or_else(|e| error!("wicket", "tool", "jpeg_encode_failed", e));
         (buf.into_inner(), rw, rh, "image/jpeg")
     } else {
-        let ext = abs_path.extension()
+        let ext = abs_path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -591,13 +835,15 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         { "type": "image", "data": encoded, "mimeType": media_type }
     ]);
 
-    send(tx, Outbound::Tool(ToolOutbound::Response {
-        call_id: call_id.to_string(),
-        output: serde_json::to_string(&content).unwrap_or_default(),
-        exit_code: 0,
-    }));
+    send(
+        tx,
+        Outbound::Tool(ToolOutbound::Response {
+            call_id: call_id.to_string(),
+            output: serde_json::to_string(&content).unwrap_or_default(),
+            exit_code: 0,
+        }),
+    );
 }
-
 
 // The envelope protocol between Easement and Wicket is strict. Every field is
 // required. No Option unless the absence is a real state (e.g. timeout not
@@ -620,7 +866,13 @@ enum Inbound {
 #[derive(serde::Deserialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ToolInbound {
-    Run { slug: String, transcript: String, call_id: String, #[serde(flatten)] tool: ToolCall },
+    Run {
+        slug: String,
+        transcript: String,
+        call_id: String,
+        #[serde(flatten)]
+        tool: ToolCall,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -644,12 +896,22 @@ enum ToolCall {
         path: String,
         r#where: String,
     },
+    Job {
+        job_id: String,
+        r#where: String,
+    },
 }
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ShellInbound {
-    Run { slug: String, transcript: String, id: String, command: String, r#where: String },
+    Run {
+        slug: String,
+        transcript: String,
+        id: String,
+        command: String,
+        r#where: String,
+    },
 }
 
 // Outbound: what Wicket sends to Easement.
@@ -664,7 +926,11 @@ enum Outbound {
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum SocketOutbound {
-    Connect { who: String, r#where: String, tools: Vec<ToolDef> },
+    Connect {
+        who: String,
+        r#where: String,
+        tools: Vec<ToolDef>,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -676,15 +942,33 @@ struct ToolDef {
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ToolOutbound {
-    Response { call_id: String, output: String, exit_code: i32 },
-    BackgroundOutput { task_uuid: String, output_path: String, line: String },
-    BackgroundDone { task_uuid: String, exit_code: i32, output_path: String },
+    Response {
+        call_id: String,
+        output: String,
+        exit_code: i32,
+    },
+    BackgroundOutput {
+        job_id: String,
+        output_path: String,
+        line: String,
+    },
+    BackgroundDone {
+        job_id: String,
+        exit_code: i32,
+        output_path: String,
+    },
 }
 
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ShellOutbound {
-    Response { id: String, slug: String, transcript: String, output: String, exit_code: i32 },
+    Response {
+        id: String,
+        slug: String,
+        transcript: String,
+        output: String,
+        exit_code: i32,
+    },
 }
 
 fn send(tx: &WsSender, msg: Outbound) {
@@ -699,13 +983,15 @@ fn send(tx: &WsSender, msg: Outbound) {
 
 #[tokio::main]
 async fn main() {
-
     let args: Vec<String> = std::env::args().collect();
     let wicket_url = args.get(1).cloned().unwrap_or_else(|| {
         eprintln!("usage: wicket <ws-url> <host-identity>");
         std::process::exit(1);
     });
-    let host_identity = args.get(2).cloned().unwrap_or_else(|| "localhost".to_string());
+    let host_identity = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "localhost".to_string());
 
     init_log(&host_identity).await;
     trace!("wicket", "lifecycle", "starting", "url": wicket_url, "where": host_identity);
@@ -739,7 +1025,7 @@ async fn main() {
         tools: vec![
             ToolDef {
                 f: "zsh".to_string(),
-                description: "Execute a command in a sandboxed Zsh shell. The command runs inside a deny-default sandbox with full read and restricted write. Args: command (string, required), where (string, required, the host identity e.g. \"localhost\"), run_in_background (bool, default false, returns immediately with a task ID and notifies on completion), timeout (int ms, optional), escalate (bool, default false, requests operator approval to run unsandboxed).".to_string(),
+                description: "Execute a command in a sandboxed Zsh shell. The command runs inside a deny-default sandbox with full read and restricted write. Args: command (string, required), where (string, required, the host identity e.g. \"localhost\"), run_in_background (bool, default false, returns immediately with a job ID and notifies on completion), timeout (int ms, optional), escalate (bool, default false, requests operator approval to run unsandboxed).".to_string(),
             },
             ToolDef {
                 f: "apply_patch".to_string(),
@@ -748,6 +1034,10 @@ async fn main() {
             ToolDef {
                 f: "view_image".to_string(),
                 description: "View an image file. Reads the file, resizes to fit within 1568px on the long edge if needed, and returns the image inline as a content block. Supports JPEG, PNG, GIF, WebP. Args: path (string, required — absolute or relative file path), where (string, required — the host identity).".to_string(),
+            },
+            ToolDef {
+                f: "job".to_string(),
+                description: "Read a background job's saved output from this host. Args: job_id (string, required — the background job ID returned by zsh), where (string, required — the host identity).".to_string(),
             },
         ],
     }));
@@ -781,11 +1071,17 @@ async fn main() {
                 };
 
                 match msg {
-                    Inbound::Tool(ToolInbound::Run { slug, transcript, call_id, tool }) => {
+                    Inbound::Tool(ToolInbound::Run {
+                        slug,
+                        transcript,
+                        call_id,
+                        tool,
+                    }) => {
                         let tool_where = match &tool {
                             ToolCall::Zsh { r#where, .. } => r#where,
                             ToolCall::ApplyPatch { r#where, .. } => r#where,
                             ToolCall::ViewImage { r#where, .. } => r#where,
+                            ToolCall::Job { r#where, .. } => r#where,
                         };
                         if tool_where != &host_identity {
                             continue;
@@ -793,13 +1089,19 @@ async fn main() {
                         trace!("wicket", "tool", "run", "call_id": call_id);
 
                         match tool {
-                            ToolCall::Zsh { command, run_in_background, timeout, escalate, .. } => {
+                            ToolCall::Zsh {
+                                command,
+                                run_in_background,
+                                timeout,
+                                escalate,
+                                ..
+                            } => {
                                 let zsh_data = json!({
                                     "command": command,
                                     "sandboxed": !escalate,
                                     "run_in_background": run_in_background,
                                     "timeout": timeout,
-                                    "task_uuid": call_id,
+                                    "job_id": call_id,
                                     "transcript": transcript,
                                 });
                                 handle_zsh(&ws_tx, &slug, &call_id, &host_identity, zsh_data).await;
@@ -812,9 +1114,18 @@ async fn main() {
                                 let image_data = json!({ "path": path });
                                 handle_view_image(&ws_tx, &call_id, image_data).await;
                             }
+                            ToolCall::Job { job_id, .. } => {
+                                handle_job(&ws_tx, &slug, &call_id, &host_identity, &job_id).await;
+                            }
                         }
                     }
-                    Inbound::Shell(ShellInbound::Run { slug, transcript, id, command, r#where }) => {
+                    Inbound::Shell(ShellInbound::Run {
+                        slug,
+                        transcript,
+                        id,
+                        command,
+                        r#where,
+                    }) => {
                         if r#where != host_identity {
                             continue;
                         }
