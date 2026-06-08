@@ -799,7 +799,10 @@ async fn handle_kill(
         return;
     };
 
-    if job.info.slug != slug || job.info.transcript != transcript || job.info.r#where != host_identity {
+    if job.info.slug != slug
+        || job.info.transcript != transcript
+        || job.info.r#where != host_identity
+    {
         drop(running);
         send(
             tx,
@@ -930,6 +933,15 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
     }
 }
 
+fn resolve_tool_path(path_str: &str) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    }
+}
+
 // Read an image, resize to fit 1568px on the long edge (Anthropic's optimal threshold),
 // base64 encode, return as an MCP image content block. Claude sees the image inline.
 // Preserves source format when possible, falls back to JPEG on resize.
@@ -937,12 +949,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
     trace!("wicket", "tool", "view_image", "path": path_str);
 
-    let path = Path::new(path_str);
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
+    let abs_path = resolve_tool_path(path_str);
 
     let file_bytes = match tokio::fs::read(&abs_path).await {
         Ok(b) => b,
@@ -1022,6 +1029,144 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     );
 }
 
+// Read a PDF as an Anthropic document content block. Large or page-specific PDF
+// handling belongs in a separate utility path; this tool just sends the PDF bytes.
+async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
+    let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    trace!("wicket", "tool", "read_pdf", "path": path_str);
+
+    let abs_path = resolve_tool_path(path_str);
+    let file_bytes = match tokio::fs::read(&abs_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("cannot read PDF: {}", e),
+                    exit_code: 1,
+                }),
+            );
+            return;
+        }
+    };
+
+    if file_bytes.is_empty() {
+        send(
+            tx,
+            Outbound::Tool(ToolOutbound::Response {
+                call_id: call_id.to_string(),
+                output: format!("PDF file is empty: {}", abs_path.display()),
+                exit_code: 1,
+            }),
+        );
+        return;
+    }
+
+    if !file_bytes.starts_with(b"%PDF-") {
+        send(
+            tx,
+            Outbound::Tool(ToolOutbound::Response {
+                call_id: call_id.to_string(),
+                output: format!("file is not a valid PDF: {}", abs_path.display()),
+                exit_code: 1,
+            }),
+        );
+        return;
+    }
+
+    let page_count = match pdf_page_count(&abs_path).await {
+        Ok(count) => count,
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!(
+                        "cannot determine PDF page count for {}: {}. Use a PDF utility to split \
+                         or render a page range first.",
+                        abs_path.display(),
+                        e
+                    ),
+                    exit_code: 1,
+                }),
+            );
+            return;
+        }
+    };
+
+    if page_count > 20 {
+        send(
+            tx,
+            Outbound::Tool(ToolOutbound::Response {
+                call_id: call_id.to_string(),
+                output: format!(
+                    "PDF has {} pages, which is too many to send at once. Use a PDF utility to \
+                     split or render 20 pages or fewer, then read that smaller PDF.",
+                    page_count
+                ),
+                exit_code: 1,
+            }),
+        );
+        return;
+    }
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
+    let content = json!([
+        { "type": "text", "text": format!("{} ({} pages, {} bytes application/pdf)", abs_path.display(), page_count, file_bytes.len()) },
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": encoded
+            }
+        }
+    ]);
+
+    send(
+        tx,
+        Outbound::Tool(ToolOutbound::Response {
+            call_id: call_id.to_string(),
+            output: serde_json::to_string(&content).unwrap_or_default(),
+            exit_code: 0,
+        }),
+    );
+}
+
+async fn pdf_page_count(path: &Path) -> Result<u32, String> {
+    let output = tokio::process::Command::new("pdfinfo")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run pdfinfo: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        return Err(if message.is_empty() {
+            format!("pdfinfo exited with {}", output.status)
+        } else {
+            format!("pdfinfo exited with {}: {}", output.status, message)
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("Pages:") else {
+            continue;
+        };
+        let count = rest
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("invalid pdfinfo Pages value: {}", e))?;
+        return Ok(count);
+    }
+
+    Err("pdfinfo output did not include a Pages field".to_string())
+}
+
 // The envelope protocol between Easement and Wicket is strict. Every field is
 // required. No Option unless the absence is a real state (e.g. timeout not
 // set). A missing field is a serialization bug, not a condition to handle at
@@ -1070,6 +1215,10 @@ enum ToolCall {
         r#where: String,
     },
     ViewImage {
+        path: String,
+        r#where: String,
+    },
+    ReadPdf {
         path: String,
         r#where: String,
     },
@@ -1245,6 +1394,15 @@ async fn main() {
                         .to_string(),
                 },
                 ToolDef {
+                    f: "read_pdf".to_string(),
+                    description: "Read a PDF file and return it inline as an Anthropic document \
+                                  content block. This refuses PDFs over 20 pages; use a PDF \
+                                  utility to split or render a smaller page range first. Args: \
+                                  path (string, required — absolute or relative PDF path), where \
+                                  (string, required — the host identity)."
+                        .to_string(),
+                },
+                ToolDef {
                     f: "job".to_string(),
                     description: "Read a background job's saved output from this host. Args: \
                                   job_id (string, required — the background job ID returned by \
@@ -1309,6 +1467,7 @@ async fn main() {
                             ToolCall::Zsh { r#where, .. } => r#where,
                             ToolCall::ApplyPatch { r#where, .. } => r#where,
                             ToolCall::ViewImage { r#where, .. } => r#where,
+                            ToolCall::ReadPdf { r#where, .. } => r#where,
                             ToolCall::Job { r#where, .. } => r#where,
                             ToolCall::Jobs { r#where } => r#where,
                             ToolCall::Kill { r#where, .. } => r#where,
@@ -1351,6 +1510,10 @@ async fn main() {
                             ToolCall::ViewImage { path, .. } => {
                                 let image_data = json!({ "path": path });
                                 handle_view_image(&ws_tx, &call_id, image_data).await;
+                            }
+                            ToolCall::ReadPdf { path, .. } => {
+                                let pdf_data = json!({ "path": path });
+                                handle_read_pdf(&ws_tx, &call_id, pdf_data).await;
                             }
                             ToolCall::Job { job_id, .. } => {
                                 handle_job(&ws_tx, &slug, &call_id, &host_identity, &job_id).await;
