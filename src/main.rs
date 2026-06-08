@@ -252,7 +252,10 @@ fn build_sandbox_command(command: &str, config: &SandboxConfig) -> tokio::proces
         "(allow file-write* (subpath \"{}\"))\n",
         std::env::temp_dir().display()
     ));
-    policy.push_str("(allow file-write-data (require-all (path \"/dev/null\") (vnode-type CHARACTER-DEVICE)))\n");
+    policy.push_str(
+        "(allow file-write-data (require-all (path \"/dev/null\") (vnode-type \
+         CHARACTER-DEVICE)))\n",
+    );
     policy.push_str("(allow pseudo-tty)\n");
     policy.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
     policy.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n");
@@ -1019,28 +1022,54 @@ async fn main() {
     });
 
     // Connect: identify ourselves and register tools.
-    send(&ws_tx, Outbound::Socket(SocketOutbound::Connect {
-        who: "wicket".to_string(),
-        r#where: host_identity.clone(),
-        tools: vec![
-            ToolDef {
-                f: "zsh".to_string(),
-                description: "Execute a command in a sandboxed Zsh shell. The command runs inside a deny-default sandbox with full read and restricted write. Args: command (string, required), where (string, required, the host identity e.g. \"localhost\"), run_in_background (bool, default false, returns immediately with a job ID and notifies on completion), timeout (int ms, optional), escalate (bool, default false, requests operator approval to run unsandboxed).".to_string(),
-            },
-            ToolDef {
-                f: "apply_patch".to_string(),
-                description: "Apply a structured diff patch to files. The patch format uses markers: *** Begin Patch, *** End Patch, *** Add File: <path>, *** Delete File: <path>, *** Update File: <path>. Update hunks use unified diff format with @@ line markers, context lines prefixed with space, removals with -, additions with +. Args: patch (string, required — the full patch text), where (string, required — the host identity).".to_string(),
-            },
-            ToolDef {
-                f: "view_image".to_string(),
-                description: "View an image file. Reads the file, resizes to fit within 1568px on the long edge if needed, and returns the image inline as a content block. Supports JPEG, PNG, GIF, WebP. Args: path (string, required — absolute or relative file path), where (string, required — the host identity).".to_string(),
-            },
-            ToolDef {
-                f: "job".to_string(),
-                description: "Read a background job's saved output from this host. Args: job_id (string, required — the background job ID returned by zsh), where (string, required — the host identity).".to_string(),
-            },
-        ],
-    }));
+    send(
+        &ws_tx,
+        Outbound::Socket(SocketOutbound::Connect {
+            who: "wicket".to_string(),
+            r#where: host_identity.clone(),
+            tools: vec![
+                ToolDef {
+                    f: "zsh".to_string(),
+                    description: "Execute a command in a sandboxed Zsh shell. The command runs \
+                                  inside a deny-default sandbox with full read and restricted \
+                                  write. Args: command (string, required), where (string, \
+                                  required, the host identity e.g. \"localhost\"), \
+                                  run_in_background (bool, default false, returns immediately \
+                                  with a job ID and notifies on completion), timeout (int ms, \
+                                  optional), escalate (bool, default false, requests operator \
+                                  approval to run unsandboxed)."
+                        .to_string(),
+                },
+                ToolDef {
+                    f: "apply_patch".to_string(),
+                    description: "Apply a structured diff patch to files. The patch format uses \
+                                  markers: *** Begin Patch, *** End Patch, *** Add File: <path>, \
+                                  *** Delete File: <path>, *** Update File: <path>. Update hunks \
+                                  use unified diff format with @@ line markers, context lines \
+                                  prefixed with space, removals with -, additions with +. Args: \
+                                  patch (string, required — the full patch text), where (string, \
+                                  required — the host identity)."
+                        .to_string(),
+                },
+                ToolDef {
+                    f: "view_image".to_string(),
+                    description: "View an image file. Reads the file, resizes to fit within \
+                                  1568px on the long edge if needed, and returns the image inline \
+                                  as a content block. Supports JPEG, PNG, GIF, WebP. Args: path \
+                                  (string, required — absolute or relative file path), where \
+                                  (string, required — the host identity)."
+                        .to_string(),
+                },
+                ToolDef {
+                    f: "job".to_string(),
+                    description: "Read a background job's saved output from this host. Args: \
+                                  job_id (string, required — the background job ID returned by \
+                                  zsh), where (string, required — the host identity)."
+                        .to_string(),
+                },
+            ],
+        }),
+    );
     trace!("wicket", "lifecycle", "connected");
 
     while let Some(result) = ws_stream_rx.next().await {
