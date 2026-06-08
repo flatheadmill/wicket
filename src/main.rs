@@ -363,6 +363,10 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
         .get("run_in_background")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let transcript = data
+        .get("transcript")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
     let job_id = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
     trace!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
 
@@ -433,6 +437,7 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                 let tx = tx.clone();
                 let output_path = output_path.clone();
                 let slug = slug.to_string();
+                let transcript = transcript.to_string();
                 let host_identity = host_identity.to_string();
                 let job_id = job_id.to_string();
                 let is_localhost = host_identity == "localhost";
@@ -479,13 +484,18 @@ async fn handle_zsh(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                         }
                     };
                     let output_path_str = final_path.to_string_lossy().to_string();
-                    trace!("wicket", "tool", "background_done", "job_id": job_id, "exit_code": code);
+                    let meta = format!(
+                        "job_id={} where={} exit_code={} output_path={}",
+                        job_id, host_identity, code, output_path_str
+                    );
+                    trace!("wicket", "tool", "notification", "job_id": job_id, "exit_code": code);
                     send(
                         &tx,
-                        Outbound::Tool(ToolOutbound::BackgroundDone {
-                            job_id,
-                            exit_code: code,
-                            output_path: output_path_str,
+                        Outbound::Tool(ToolOutbound::Notification {
+                            slug,
+                            transcript,
+                            message: "Background job exited.".to_string(),
+                            meta: Some(meta),
                         }),
                     );
                 });
@@ -955,10 +965,12 @@ enum ToolOutbound {
         output_path: String,
         line: String,
     },
-    BackgroundDone {
-        job_id: String,
-        exit_code: i32,
-        output_path: String,
+    Notification {
+        slug: String,
+        transcript: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<String>,
     },
 }
 
