@@ -212,7 +212,9 @@ async fn init_log(host_identity: &str) {
 
 type WsSender = mpsc::UnboundedSender<String>;
 
-type RunningJobs = Arc<Mutex<HashMap<String, RunningJob>>>;
+type RouterTx = mpsc::UnboundedSender<Event>;
+
+type RunningJobs = HashMap<String, RunningJob>;
 
 #[derive(Clone, Serialize)]
 struct RunningJobInfo {
@@ -228,6 +230,31 @@ struct RunningJobInfo {
 struct RunningJob {
     info: RunningJobInfo,
     kill_tx: Option<oneshot::Sender<()>>,
+}
+
+struct JobFinished {
+    job_id: String,
+    slug: String,
+    transcript: String,
+    host_identity: String,
+    exit_code: i32,
+    output_path: PathBuf,
+}
+
+struct JobFailed {
+    job_id: String,
+    slug: String,
+    transcript: String,
+    host_identity: String,
+    error: String,
+    output_path: PathBuf,
+}
+
+enum Event {
+    Inbound(Inbound),
+    JobFinished(JobFinished),
+    JobFailed(JobFailed),
+    Disconnected,
 }
 
 // The sandbox is the permission system. Every zsh command runs inside seatbelt (macOS)
@@ -499,9 +526,91 @@ mod tests {
 // output) and background (spawn, return immediately, notify when done). Background tasks
 // stream stdout to a file and emit a completion event — the CLI delivers it to Claude as
 // a task notification on the next turn.
+async fn handle_zsh_foreground(
+    tx: WsSender,
+    slug: String,
+    call_id: String,
+    command: String,
+    sandboxed: bool,
+    timeout_ms: u64,
+) {
+    let cwd = match ensure_pane_dir(&slug).await {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            send(
+                &tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id,
+                    output: format!("failed to create pane directory: {}", e),
+                    exit_code: 1,
+                    changes: None,
+                }),
+            );
+            return;
+        }
+    };
+
+    let output = if sandboxed {
+        let config = read_sandbox_config(&slug).await;
+        let mut cmd = build_sandbox_command(&command, &config);
+        cmd.env("RUNNING_UNDER_WICKET", "1");
+        cmd.current_dir(&cwd);
+        run_foreground_command(cmd, timeout_ms).await
+    } else {
+        trace!("wicket", "tool", "unsandboxed", "command": command);
+        let mut cmd = tokio::process::Command::new("zsh");
+        cmd.env("RUNNING_UNDER_WICKET", "1");
+        cmd.current_dir(&cwd);
+        cmd.arg("-c").arg(&command);
+        run_foreground_command(cmd, timeout_ms).await
+    };
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut combined = if stderr.is_empty() {
+                stdout.to_string()
+            } else {
+                format!("{}{}", stdout, stderr)
+            };
+            if out.timed_out {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&format!(
+                    "command timed out after {} ms; process group was killed",
+                    timeout_ms
+                ));
+            }
+            send(
+                &tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id,
+                    output: combined,
+                    exit_code: if out.timed_out { 124 } else { out.exit_code },
+                    changes: None,
+                }),
+            );
+        }
+        Err(e) => {
+            send(
+                &tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id,
+                    output: format!("failed to execute: {}", e),
+                    exit_code: 1,
+                    changes: None,
+                }),
+            );
+        }
+    }
+}
+
 async fn handle_zsh(
     tx: &WsSender,
-    jobs: &RunningJobs,
+    jobs: &mut RunningJobs,
+    router_tx: &RouterTx,
     slug: &str,
     call_id: &str,
     host_identity: &str,
@@ -526,6 +635,17 @@ async fn handle_zsh(
         .unwrap_or("default");
     let job_id = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
     trace!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
+
+    if !run_bg {
+        let tx = tx.clone();
+        let slug = slug.to_string();
+        let call_id = call_id.to_string();
+        let command = command.to_string();
+        tokio::spawn(async move {
+            handle_zsh_foreground(tx, slug, call_id, command, sandboxed, timeout_ms).await;
+        });
+        return;
+    }
 
     let cwd = match ensure_pane_dir(slug).await {
         Ok(cwd) => cwd,
@@ -581,7 +701,7 @@ async fn handle_zsh(
         match cmd.spawn() {
             Ok(mut child) => {
                 let (kill_tx, mut kill_rx) = oneshot::channel();
-                jobs.lock().await.insert(
+                jobs.insert(
                     job_id.to_string(),
                     RunningJob {
                         info: RunningJobInfo {
@@ -612,12 +732,12 @@ async fn handle_zsh(
                 );
 
                 let tx = tx.clone();
+                let router_tx = router_tx.clone();
                 let output_path = output_path.clone();
                 let slug = slug.to_string();
                 let transcript = transcript.to_string();
                 let host_identity = host_identity.to_string();
                 let job_id = job_id.to_string();
-                let jobs = jobs.clone();
                 let is_localhost = host_identity == "localhost";
                 let file = Arc::new(Mutex::new(file));
 
@@ -660,9 +780,11 @@ async fn handle_zsh(
                     for task in stream_tasks {
                         let _ = task.await;
                     }
-                    let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                    jobs.lock().await.remove(&job_id);
                     drop(file);
+                    let code = status
+                        .as_ref()
+                        .map(|s| s.code().unwrap_or(-1))
+                        .unwrap_or(-1);
                     let finished_path = finished_job_path(&slug, &host_identity, &job_id, code);
                     let final_path = match tokio::fs::rename(&output_path, &finished_path).await {
                         Ok(()) => finished_path,
@@ -671,21 +793,28 @@ async fn handle_zsh(
                             output_path
                         }
                     };
-                    let output_path_str = final_path.to_string_lossy().to_string();
-                    let meta = format!(
-                        "job_id={} where={} exit_code={} output_path={}",
-                        job_id, host_identity, code, output_path_str
-                    );
-                    trace!("wicket", "tool", "notification", "job_id": job_id, "exit_code": code);
-                    send(
-                        &tx,
-                        Outbound::Tool(ToolOutbound::Notification {
-                            slug,
-                            transcript,
-                            message: "Background job exited.".to_string(),
-                            meta: Some(meta),
-                        }),
-                    );
+                    match status {
+                        Ok(_) => {
+                            let _ = router_tx.send(Event::JobFinished(JobFinished {
+                                job_id,
+                                slug,
+                                transcript,
+                                host_identity,
+                                exit_code: code,
+                                output_path: final_path,
+                            }));
+                        }
+                        Err(e) => {
+                            let _ = router_tx.send(Event::JobFailed(JobFailed {
+                                job_id,
+                                slug,
+                                transcript,
+                                host_identity,
+                                error: e.to_string(),
+                                output_path: final_path,
+                            }));
+                        }
+                    }
                 });
             }
             Err(e) => {
@@ -701,62 +830,6 @@ async fn handle_zsh(
             }
         }
         return;
-    }
-
-    let output = if sandboxed {
-        let config = read_sandbox_config(slug).await;
-        let mut cmd = build_sandbox_command(command, &config);
-        cmd.env("RUNNING_UNDER_WICKET", "1");
-        cmd.current_dir(&cwd);
-        run_foreground_command(cmd, timeout_ms).await
-    } else {
-        trace!("wicket", "tool", "unsandboxed", "command": command);
-        let mut cmd = tokio::process::Command::new("zsh");
-        cmd.env("RUNNING_UNDER_WICKET", "1");
-        cmd.current_dir(&cwd);
-        cmd.arg("-c").arg(command);
-        run_foreground_command(cmd, timeout_ms).await
-    };
-
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut combined = if stderr.is_empty() {
-                stdout.to_string()
-            } else {
-                format!("{}{}", stdout, stderr)
-            };
-            if out.timed_out {
-                if !combined.is_empty() && !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str(&format!(
-                    "command timed out after {} ms; process group was killed",
-                    timeout_ms
-                ));
-            }
-            send(
-                tx,
-                Outbound::Tool(ToolOutbound::Response {
-                    call_id: call_id.to_string(),
-                    output: combined,
-                    exit_code: if out.timed_out { 124 } else { out.exit_code },
-                    changes: None,
-                }),
-            );
-        }
-        Err(e) => {
-            send(
-                tx,
-                Outbound::Tool(ToolOutbound::Response {
-                    call_id: call_id.to_string(),
-                    output: format!("failed to execute: {}", e),
-                    exit_code: 1,
-                    changes: None,
-                }),
-            );
-        }
     }
 }
 
@@ -890,8 +963,7 @@ async fn handle_jobs(
     call_id: &str,
     host_identity: &str,
 ) {
-    let running = jobs.lock().await;
-    let jobs = running
+    let jobs = jobs
         .values()
         .filter(|job| {
             job.info.slug == slug
@@ -900,7 +972,6 @@ async fn handle_jobs(
         })
         .map(|job| job.info.clone())
         .collect::<Vec<_>>();
-    drop(running);
 
     let output = if jobs.is_empty() {
         format!(
@@ -924,16 +995,14 @@ async fn handle_jobs(
 
 async fn handle_kill(
     tx: &WsSender,
-    jobs: &RunningJobs,
+    jobs: &mut RunningJobs,
     slug: &str,
     transcript: &str,
     call_id: &str,
     host_identity: &str,
     job_id: &str,
 ) {
-    let mut running = jobs.lock().await;
-    let Some(job) = running.get_mut(job_id) else {
-        drop(running);
+    let Some(job) = jobs.get_mut(job_id) else {
         send(
             tx,
             Outbound::Tool(ToolOutbound::Response {
@@ -953,7 +1022,6 @@ async fn handle_kill(
         || job.info.transcript != transcript
         || job.info.r#where != host_identity
     {
-        drop(running);
         send(
             tx,
             Outbound::Tool(ToolOutbound::Response {
@@ -970,7 +1038,6 @@ async fn handle_kill(
     }
 
     let Some(kill_tx) = job.kill_tx.take() else {
-        drop(running);
         send(
             tx,
             Outbound::Tool(ToolOutbound::Response {
@@ -982,7 +1049,6 @@ async fn handle_kill(
         );
         return;
     };
-    drop(running);
 
     let sent = kill_tx.send(()).is_ok();
     send(
@@ -1628,7 +1694,8 @@ async fn main() {
     let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
 
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
-    let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+    let (router_tx, mut router_rx) = mpsc::unbounded_channel::<Event>();
+    let mut running_jobs: RunningJobs = HashMap::new();
 
     tokio::spawn(async move {
         while let Some(msg) = ws_rx.recv().await {
@@ -1714,142 +1781,236 @@ async fn main() {
     );
     trace!("wicket", "lifecycle", "connected");
 
-    while let Some(result) = ws_stream_rx.next().await {
-        match result {
-            Ok(Message::Text(text)) => {
-                let raw: Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("wicket", "websocket", "parse_json", e, "raw": text);
-                        continue;
-                    }
-                };
-
-                let what = raw.get("what").and_then(|v| v.as_str()).unwrap_or("");
-                if what == "tool" || what == "shell" {
-                    wire!("wicket", "websocket", "recv", "raw": raw);
-                } else {
-                    dump!("wicket", "websocket", "ignored", "raw": raw);
-                    continue;
-                }
-
-                let msg: Inbound = match serde_json::from_value(raw.clone()) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("wicket", "websocket", "decode", e, "raw": raw);
-                        continue;
-                    }
-                };
-
-                match msg {
-                    Inbound::Tool(ToolInbound::Run {
-                        slug,
-                        transcript,
-                        call_id,
-                        tool,
-                    }) => {
-                        let tool_where = match &tool {
-                            ToolCall::Zsh { r#where, .. } => r#where,
-                            ToolCall::ApplyPatch { r#where, .. } => r#where,
-                            ToolCall::ViewImage { r#where, .. } => r#where,
-                            ToolCall::ReadPdf { r#where, .. } => r#where,
-                            ToolCall::Job { r#where, .. } => r#where,
-                            ToolCall::Jobs { r#where } => r#where,
-                            ToolCall::Kill { r#where, .. } => r#where,
-                        };
-                        if tool_where != &host_identity {
+    let reader_tx = router_tx.clone();
+    tokio::spawn(async move {
+        let mut sent_disconnect = false;
+        while let Some(result) = ws_stream_rx.next().await {
+            match result {
+                Ok(Message::Text(text)) => {
+                    let raw: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("wicket", "websocket", "parse_json", e, "raw": text);
                             continue;
                         }
-                        trace!("wicket", "tool", "run", "call_id": call_id);
+                    };
 
-                        match tool {
-                            ToolCall::Zsh {
-                                command,
-                                run_in_background,
-                                timeout,
-                                escalate,
-                                ..
-                            } => {
-                                let zsh_data = json!({
-                                    "command": command,
-                                    "sandboxed": !escalate,
-                                    "run_in_background": run_in_background,
-                                    "timeout": timeout,
-                                    "job_id": call_id,
-                                    "transcript": transcript,
-                                });
-                                handle_zsh(
-                                    &ws_tx,
-                                    &running_jobs,
-                                    &slug,
-                                    &call_id,
-                                    &host_identity,
-                                    zsh_data,
-                                )
-                                .await;
-                            }
-                            ToolCall::ApplyPatch { patch, .. } => {
-                                let patch_data = json!({ "patch": patch });
-                                handle_apply_patch(&ws_tx, &slug, &call_id, patch_data).await;
-                            }
-                            ToolCall::ViewImage { path, .. } => {
-                                let image_data = json!({ "path": path });
-                                handle_view_image(&ws_tx, &call_id, image_data).await;
-                            }
-                            ToolCall::ReadPdf { path, .. } => {
-                                let pdf_data = json!({ "path": path });
-                                handle_read_pdf(&ws_tx, &call_id, pdf_data).await;
-                            }
-                            ToolCall::Job { job_id, .. } => {
-                                handle_job(&ws_tx, &slug, &call_id, &host_identity, &job_id).await;
-                            }
-                            ToolCall::Jobs { .. } => {
-                                handle_jobs(
-                                    &ws_tx,
-                                    &running_jobs,
-                                    &slug,
-                                    &transcript,
-                                    &call_id,
-                                    &host_identity,
-                                )
-                                .await;
-                            }
-                            ToolCall::Kill { job_id, .. } => {
-                                handle_kill(
-                                    &ws_tx,
-                                    &running_jobs,
-                                    &slug,
-                                    &transcript,
-                                    &call_id,
-                                    &host_identity,
-                                    &job_id,
-                                )
-                                .await;
-                            }
-                        }
+                    let what = raw.get("what").and_then(|v| v.as_str()).unwrap_or("");
+                    if what == "tool" || what == "shell" {
+                        wire!("wicket", "websocket", "recv", "raw": raw);
+                    } else {
+                        dump!("wicket", "websocket", "ignored", "raw": raw);
+                        continue;
                     }
-                    Inbound::Shell(ShellInbound::Run {
-                        slug,
-                        transcript,
-                        id,
-                        command,
-                        r#where,
-                    }) => {
-                        if r#where != host_identity {
+
+                    let msg: Inbound = match serde_json::from_value(raw.clone()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!("wicket", "websocket", "decode", e, "raw": raw);
                             continue;
                         }
-                        trace!("wicket", "shell", "run", "id": id, "command": command);
-                        let shell_data = json!({ "command": command });
-                        handle_shell(&ws_tx, &slug, &transcript, &id, shell_data).await;
+                    };
+
+                    if reader_tx.send(Event::Inbound(msg)).is_err() {
+                        break;
                     }
                 }
+                Ok(Message::Close(_)) => {
+                    let _ = reader_tx.send(Event::Disconnected);
+                    sent_disconnect = true;
+                    break;
+                }
+                Err(e) => {
+                    error!("wicket", "websocket", "read", e);
+                    let _ = reader_tx.send(Event::Disconnected);
+                    sent_disconnect = true;
+                    break;
+                }
+                _ => {}
             }
-            Ok(Message::Close(_)) => break,
-            Err(e) => {
-                error!("wicket", "websocket", "read", e);
+        }
+        if !sent_disconnect {
+            let _ = reader_tx.send(Event::Disconnected);
+        }
+    });
+
+    while let Some(event) = router_rx.recv().await {
+        match event {
+            Event::Inbound(msg) => match msg {
+                Inbound::Tool(ToolInbound::Run {
+                    slug,
+                    transcript,
+                    call_id,
+                    tool,
+                }) => {
+                    let tool_where = match &tool {
+                        ToolCall::Zsh { r#where, .. } => r#where,
+                        ToolCall::ApplyPatch { r#where, .. } => r#where,
+                        ToolCall::ViewImage { r#where, .. } => r#where,
+                        ToolCall::ReadPdf { r#where, .. } => r#where,
+                        ToolCall::Job { r#where, .. } => r#where,
+                        ToolCall::Jobs { r#where } => r#where,
+                        ToolCall::Kill { r#where, .. } => r#where,
+                    };
+                    if tool_where != &host_identity {
+                        continue;
+                    }
+                    trace!("wicket", "tool", "run", "call_id": call_id);
+
+                    match tool {
+                        ToolCall::Zsh {
+                            command,
+                            run_in_background,
+                            timeout,
+                            escalate,
+                            ..
+                        } => {
+                            let zsh_data = json!({
+                                "command": command,
+                                "sandboxed": !escalate,
+                                "run_in_background": run_in_background,
+                                "timeout": timeout,
+                                "job_id": call_id,
+                                "transcript": transcript,
+                            });
+                            handle_zsh(
+                                &ws_tx,
+                                &mut running_jobs,
+                                &router_tx,
+                                &slug,
+                                &call_id,
+                                &host_identity,
+                                zsh_data,
+                            )
+                            .await;
+                        }
+                        ToolCall::ApplyPatch { patch, .. } => {
+                            let tx = ws_tx.clone();
+                            tokio::spawn(async move {
+                                let patch_data = json!({ "patch": patch });
+                                handle_apply_patch(&tx, &slug, &call_id, patch_data).await;
+                            });
+                        }
+                        ToolCall::ViewImage { path, .. } => {
+                            let tx = ws_tx.clone();
+                            tokio::spawn(async move {
+                                let image_data = json!({ "path": path });
+                                handle_view_image(&tx, &call_id, image_data).await;
+                            });
+                        }
+                        ToolCall::ReadPdf { path, .. } => {
+                            let tx = ws_tx.clone();
+                            tokio::spawn(async move {
+                                let pdf_data = json!({ "path": path });
+                                handle_read_pdf(&tx, &call_id, pdf_data).await;
+                            });
+                        }
+                        ToolCall::Job { job_id, .. } => {
+                            let tx = ws_tx.clone();
+                            let host_identity = host_identity.clone();
+                            tokio::spawn(async move {
+                                handle_job(&tx, &slug, &call_id, &host_identity, &job_id).await;
+                            });
+                        }
+                        ToolCall::Jobs { .. } => {
+                            handle_jobs(
+                                &ws_tx,
+                                &running_jobs,
+                                &slug,
+                                &transcript,
+                                &call_id,
+                                &host_identity,
+                            )
+                            .await;
+                        }
+                        ToolCall::Kill { job_id, .. } => {
+                            handle_kill(
+                                &ws_tx,
+                                &mut running_jobs,
+                                &slug,
+                                &transcript,
+                                &call_id,
+                                &host_identity,
+                                &job_id,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Inbound::Shell(ShellInbound::Run {
+                    slug,
+                    transcript,
+                    id,
+                    command,
+                    r#where,
+                }) => {
+                    if r#where != host_identity {
+                        continue;
+                    }
+                    trace!("wicket", "shell", "run", "id": id, "command": command);
+                    let tx = ws_tx.clone();
+                    tokio::spawn(async move {
+                        let shell_data = json!({ "command": command });
+                        handle_shell(&tx, &slug, &transcript, &id, shell_data).await;
+                    });
+                }
+            },
+            Event::JobFinished(finished) => {
+                running_jobs.remove(&finished.job_id);
+                let output_path_str = finished.output_path.to_string_lossy().to_string();
+                let meta = format!(
+                    "job_id={} where={} exit_code={} output_path={}",
+                    finished.job_id, finished.host_identity, finished.exit_code, output_path_str
+                );
+                trace!(
+                    "wicket",
+                    "tool",
+                    "notification",
+                    "job_id": finished.job_id,
+                    "exit_code": finished.exit_code
+                );
+                send(
+                    &ws_tx,
+                    Outbound::Tool(ToolOutbound::Notification {
+                        slug: finished.slug,
+                        transcript: finished.transcript,
+                        message: "Background job exited.".to_string(),
+                        meta: Some(meta),
+                    }),
+                );
+            }
+            Event::JobFailed(failed) => {
+                running_jobs.remove(&failed.job_id);
+                let output_path_str = failed.output_path.to_string_lossy().to_string();
+                let meta = format!(
+                    "job_id={} where={} exit_code=-1 output_path={}",
+                    failed.job_id, failed.host_identity, output_path_str
+                );
+                error!(
+                    "wicket",
+                    "tool",
+                    "job_failed",
+                    std::io::Error::new(std::io::ErrorKind::Other, failed.error.clone()),
+                    "job_id": failed.job_id
+                );
+                send(
+                    &ws_tx,
+                    Outbound::Tool(ToolOutbound::Notification {
+                        slug: failed.slug,
+                        transcript: failed.transcript,
+                        message: "Background job exited.".to_string(),
+                        meta: Some(meta),
+                    }),
+                );
+            }
+            Event::Disconnected => {
+                for (_, mut job) in running_jobs.drain() {
+                    if let Some(kill_tx) = job.kill_tx.take() {
+                        let _ = kill_tx.send(());
+                    }
+                }
                 break;
             }
-            _ => {}
         }
     }
 
