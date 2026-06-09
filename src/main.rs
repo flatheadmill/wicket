@@ -8,13 +8,20 @@
 //   ssh host wicket ws://localhost:6502  # remote executor (via SSH tunnel)
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
+use codex_apply_patch::{
+    maybe_parse_apply_patch_verified, ApplyPatchAction, ApplyPatchFileChange,
+    MaybeApplyPatchVerified,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -36,6 +43,7 @@ struct LogEntry {
 }
 
 static LOG: OnceLock<broadcast::Sender<LogMessage>> = OnceLock::new();
+static APPLY_PATCH_CWD_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
 fn log(level: u8, msg: LogMessage) {
     if let Some(tx) = LOG.get() {
@@ -100,7 +108,7 @@ fn job_dir(slug: &str, host_identity: &str) -> PathBuf {
 }
 
 fn running_job_path(slug: &str, host_identity: &str, job_id: &str) -> PathBuf {
-    job_dir(slug, host_identity).join(format!("{}.running.job", job_id))
+    job_dir(slug, host_identity).join(format!("{}.job", job_id))
 }
 
 fn finished_job_path(slug: &str, host_identity: &str, job_id: &str, exit_code: i32) -> PathBuf {
@@ -113,7 +121,7 @@ async fn find_job_path(
     job_id: &str,
 ) -> std::io::Result<Option<PathBuf>> {
     let dir = job_dir(slug, host_identity);
-    let running = dir.join(format!("{}.running.job", job_id));
+    let running = dir.join(format!("{}.job", job_id));
     if tokio::fs::try_exists(&running).await? {
         return Ok(Some(running));
     }
@@ -368,6 +376,125 @@ async fn append_job_stream<R>(
     }
 }
 
+struct ForegroundOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+    timed_out: bool,
+}
+
+#[cfg(unix)]
+fn put_child_in_own_process_group(cmd: &mut tokio::process::Command) {
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn put_child_in_own_process_group(_cmd: &mut tokio::process::Command) {}
+
+#[cfg(unix)]
+fn kill_child_process_group(pid: u32) -> io::Result<()> {
+    let result = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_pid: u32) -> io::Result<()> {
+    Ok(())
+}
+
+async fn run_foreground_command(
+    mut cmd: tokio::process::Command,
+    timeout_ms: u64,
+) -> io::Result<ForegroundOutput> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    put_child_in_own_process_group(&mut cmd);
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stdout.take() {
+            let _ = stream.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stderr.take() {
+            let _ = stream.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let mut timed_out = false;
+    let status = match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            timed_out = true;
+            if let Some(pid) = pid {
+                let _ = kill_child_process_group(pid);
+            }
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(status) => status?,
+                Err(_) => {
+                    let _ = child.start_kill();
+                    child.wait().await?
+                }
+            }
+        }
+    };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    Ok(ForegroundOutput {
+        stdout,
+        stderr,
+        exit_code: status.code().unwrap_or(-1),
+        timed_out,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_apply_patch::{maybe_parse_apply_patch_verified, MaybeApplyPatchVerified};
+
+    use super::patch_changes_for_tui;
+
+    #[test]
+    fn patch_changes_for_tui_uses_file_change_schema() {
+        let cwd =
+            std::env::temp_dir().join(format!("wicket-apply-patch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: hello.txt\n+Hello\n*** End Patch\n";
+        let action = match maybe_parse_apply_patch_verified(
+            &["apply_patch".to_string(), patch.to_string()],
+            &cwd,
+        ) {
+            MaybeApplyPatchVerified::Body(action) => action,
+            other => panic!("unexpected apply_patch parse result: {:?}", other),
+        };
+        let changes = patch_changes_for_tui(&action);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0]["path"],
+            cwd.join("hello.txt").to_string_lossy().to_string()
+        );
+        assert_eq!(changes[0]["kind"], serde_json::json!({ "type": "add" }));
+        assert_eq!(changes[0]["diff"], "Hello\n");
+
+        std::fs::remove_dir_all(&cwd).unwrap();
+    }
+}
+
 // Sandboxed shell. Runs inside seatbelt or bubblewrap. Supports foreground (wait for
 // output) and background (spawn, return immediately, notify when done). Background tasks
 // stream stdout to a file and emit a completion event — the CLI delivers it to Claude as
@@ -389,6 +516,10 @@ async fn handle_zsh(
         .get("run_in_background")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let timeout_ms = data
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300_000);
     let transcript = data
         .get("transcript")
         .and_then(|v| v.as_str())
@@ -405,6 +536,7 @@ async fn handle_zsh(
                     call_id: call_id.to_string(),
                     output: format!("failed to create pane directory: {}", e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -425,6 +557,7 @@ async fn handle_zsh(
                         call_id: call_id.to_string(),
                         output: format!("failed to create output file: {}", e),
                         exit_code: 1,
+                        changes: None,
                     }),
                 );
                 return;
@@ -474,6 +607,7 @@ async fn handle_zsh(
                             output_path.display()
                         ),
                         exit_code: 0,
+                        changes: None,
                     }),
                 );
 
@@ -561,6 +695,7 @@ async fn handle_zsh(
                         call_id: call_id.to_string(),
                         output: format!("failed to spawn background task: {}", e),
                         exit_code: 1,
+                        changes: None,
                     }),
                 );
             }
@@ -573,33 +708,41 @@ async fn handle_zsh(
         let mut cmd = build_sandbox_command(command, &config);
         cmd.env("RUNNING_UNDER_WICKET", "1");
         cmd.current_dir(&cwd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        cmd.output().await
+        run_foreground_command(cmd, timeout_ms).await
     } else {
         trace!("wicket", "tool", "unsandboxed", "command": command);
         let mut cmd = tokio::process::Command::new("zsh");
         cmd.env("RUNNING_UNDER_WICKET", "1");
         cmd.current_dir(&cwd);
         cmd.arg("-c").arg(command);
-        cmd.output().await
+        run_foreground_command(cmd, timeout_ms).await
     };
 
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = if stderr.is_empty() {
+            let mut combined = if stderr.is_empty() {
                 stdout.to_string()
             } else {
                 format!("{}{}", stdout, stderr)
             };
-            let code = out.status.code().unwrap_or(-1);
+            if out.timed_out {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&format!(
+                    "command timed out after {} ms; process group was killed",
+                    timeout_ms
+                ));
+            }
             send(
                 tx,
                 Outbound::Tool(ToolOutbound::Response {
                     call_id: call_id.to_string(),
                     output: combined,
-                    exit_code: code,
+                    exit_code: if out.timed_out { 124 } else { out.exit_code },
+                    changes: None,
                 }),
             );
         }
@@ -610,6 +753,7 @@ async fn handle_zsh(
                     call_id: call_id.to_string(),
                     output: format!("failed to execute: {}", e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
         }
@@ -693,6 +837,7 @@ async fn handle_job(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                     call_id: call_id.to_string(),
                     output: format!("job {} not found on {}", job_id, host_identity),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -704,6 +849,7 @@ async fn handle_job(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                     call_id: call_id.to_string(),
                     output: format!("failed to find job {}: {}", job_id, e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -718,6 +864,7 @@ async fn handle_job(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                     call_id: call_id.to_string(),
                     output: format!("job {} output at {}\n\n{}", job_id, path.display(), output),
                     exit_code: 0,
+                    changes: None,
                 }),
             );
         }
@@ -728,6 +875,7 @@ async fn handle_job(tx: &WsSender, slug: &str, call_id: &str, host_identity: &st
                     call_id: call_id.to_string(),
                     output: format!("failed to read job {}: {}", job_id, e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
         }
@@ -769,6 +917,7 @@ async fn handle_jobs(
             call_id: call_id.to_string(),
             output,
             exit_code: 0,
+            changes: None,
         }),
     );
 }
@@ -794,6 +943,7 @@ async fn handle_kill(
                     job_id, slug, transcript, host_identity
                 ),
                 exit_code: 1,
+                changes: None,
             }),
         );
         return;
@@ -813,6 +963,7 @@ async fn handle_kill(
                     job_id, slug, transcript, host_identity
                 ),
                 exit_code: 1,
+                changes: None,
             }),
         );
         return;
@@ -826,6 +977,7 @@ async fn handle_kill(
                 call_id: call_id.to_string(),
                 output: format!("kill already requested for job {}", job_id),
                 exit_code: 1,
+                changes: None,
             }),
         );
         return;
@@ -843,8 +995,55 @@ async fn handle_kill(
                 format!("job {} finished before kill request was delivered", job_id)
             },
             exit_code: if sent { 0 } else { 1 },
+            changes: None,
         }),
     );
+}
+
+fn patch_changes_for_tui(action: &ApplyPatchAction) -> Vec<Value> {
+    let mut changes = action
+        .changes()
+        .iter()
+        .map(|(path, change)| {
+            let path = path.to_string_lossy().to_string();
+            match change {
+                ApplyPatchFileChange::Add { content } => json!({
+                    "path": path,
+                    "kind": { "type": "add" },
+                    "diff": content,
+                }),
+                ApplyPatchFileChange::Delete { content } => json!({
+                    "path": path,
+                    "kind": { "type": "delete" },
+                    "diff": content,
+                }),
+                ApplyPatchFileChange::Update {
+                    unified_diff,
+                    move_path,
+                    ..
+                } => {
+                    let mut diff = unified_diff.clone();
+                    let move_path_json =
+                        move_path.as_ref().map(|p| p.to_string_lossy().to_string());
+                    if let Some(move_path) = &move_path_json {
+                        diff.push_str(&format!("\n\nMoved to: {move_path}"));
+                    }
+                    json!({
+                        "path": path,
+                        "kind": { "type": "update", "move_path": move_path_json },
+                        "diff": diff,
+                    })
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    changes.sort_by(|a, b| {
+        let a = a.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let b = b.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        a.cmp(b)
+    });
+    changes
 }
 
 // Structured diffs via the codex-apply-patch crate. Validates every target path against
@@ -855,8 +1054,21 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
     trace!("wicket", "tool", "apply_patch");
 
     let sandbox_config = read_sandbox_config(slug).await;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
+    let cwd = match ensure_pane_dir(slug).await {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            send(
+                tx,
+                Outbound::Tool(ToolOutbound::Response {
+                    call_id: call_id.to_string(),
+                    output: format!("failed to create pane directory: {}", e),
+                    exit_code: 1,
+                    changes: None,
+                }),
+            );
+            return;
+        }
+    };
     match codex_apply_patch::parse_patch(patch) {
         Ok(parsed) => {
             let mut denied_path = None;
@@ -884,36 +1096,97 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
                         call_id: call_id.to_string(),
                         output: format!("patch denied: {} is not inside a writable root", denied),
                         exit_code: 1,
+                        changes: None,
                     }),
                 );
             } else {
-                let mut stdout_buf = Vec::new();
-                let mut stderr_buf = Vec::new();
-                match codex_apply_patch::apply_patch(patch, &mut stdout_buf, &mut stderr_buf) {
-                    Ok(()) => {
-                        let output = String::from_utf8_lossy(&stdout_buf);
+                let verified = maybe_parse_apply_patch_verified(
+                    &["apply_patch".to_string(), patch.to_string()],
+                    &cwd,
+                );
+                match verified {
+                    MaybeApplyPatchVerified::Body(action) => {
+                        let changes = patch_changes_for_tui(&action);
+                        let mut stdout_buf = Vec::new();
+                        let mut stderr_buf = Vec::new();
+                        let cwd_lock = APPLY_PATCH_CWD_LOCK.get_or_init(|| StdMutex::new(()));
+                        let _cwd_guard = cwd_lock.lock().expect("apply_patch cwd lock poisoned");
+                        let previous_cwd = std::env::current_dir();
+                        let cd_result = std::env::set_current_dir(&action.cwd);
+                        let apply_result = if let Err(e) = cd_result {
+                            Err(e.into())
+                        } else {
+                            codex_apply_patch::apply_patch(
+                                &action.patch,
+                                &mut stdout_buf,
+                                &mut stderr_buf,
+                            )
+                        };
+                        if let Ok(previous_cwd) = previous_cwd {
+                            let _ = std::env::set_current_dir(previous_cwd);
+                        }
+                        match apply_result {
+                            Ok(()) => {
+                                let output = String::from_utf8_lossy(&stdout_buf);
+                                send(
+                                    tx,
+                                    Outbound::Tool(ToolOutbound::Response {
+                                        call_id: call_id.to_string(),
+                                        output: output.trim_end().to_string(),
+                                        exit_code: 0,
+                                        changes: Some(Value::Array(changes)),
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                let stderr_str = String::from_utf8_lossy(&stderr_buf);
+                                let output = if stderr_str.is_empty() {
+                                    format!("patch failed: {}", e)
+                                } else {
+                                    format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
+                                };
+                                send(
+                                    tx,
+                                    Outbound::Tool(ToolOutbound::Response {
+                                        call_id: call_id.to_string(),
+                                        output,
+                                        exit_code: 1,
+                                        changes: None,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    MaybeApplyPatchVerified::ShellParseError(e) => {
                         send(
                             tx,
                             Outbound::Tool(ToolOutbound::Response {
                                 call_id: call_id.to_string(),
-                                output: output.trim_end().to_string(),
-                                exit_code: 0,
+                                output: format!("patch shell parse error: {:?}", e),
+                                exit_code: 1,
+                                changes: None,
                             }),
                         );
                     }
-                    Err(e) => {
-                        let stderr_str = String::from_utf8_lossy(&stderr_buf);
-                        let output = if stderr_str.is_empty() {
-                            format!("patch failed: {}", e)
-                        } else {
-                            format!("{}\npatch failed: {}", stderr_str.trim_end(), e)
-                        };
+                    MaybeApplyPatchVerified::CorrectnessError(e) => {
                         send(
                             tx,
                             Outbound::Tool(ToolOutbound::Response {
                                 call_id: call_id.to_string(),
-                                output,
+                                output: format!("patch failed verification: {}", e),
                                 exit_code: 1,
+                                changes: None,
+                            }),
+                        );
+                    }
+                    MaybeApplyPatchVerified::NotApplyPatch => {
+                        send(
+                            tx,
+                            Outbound::Tool(ToolOutbound::Response {
+                                call_id: call_id.to_string(),
+                                output: "not an apply_patch invocation".to_string(),
+                                exit_code: 1,
+                                changes: None,
                             }),
                         );
                     }
@@ -927,6 +1200,7 @@ async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Valu
                     call_id: call_id.to_string(),
                     output: format!("patch parse error: {}", e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
         }
@@ -960,6 +1234,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
                     call_id: call_id.to_string(),
                     output: format!("cannot read image: {}", e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -975,6 +1250,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
                     call_id: call_id.to_string(),
                     output: format!("cannot decode image: {}", e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -1025,6 +1301,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
             call_id: call_id.to_string(),
             output: serde_json::to_string(&content).unwrap_or_default(),
             exit_code: 0,
+            changes: None,
         }),
     );
 }
@@ -1045,6 +1322,7 @@ async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
                     call_id: call_id.to_string(),
                     output: format!("cannot read PDF: {}", e),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -1058,6 +1336,7 @@ async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
                 call_id: call_id.to_string(),
                 output: format!("PDF file is empty: {}", abs_path.display()),
                 exit_code: 1,
+                changes: None,
             }),
         );
         return;
@@ -1070,6 +1349,7 @@ async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
                 call_id: call_id.to_string(),
                 output: format!("file is not a valid PDF: {}", abs_path.display()),
                 exit_code: 1,
+                changes: None,
             }),
         );
         return;
@@ -1089,6 +1369,7 @@ async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
                         e
                     ),
                     exit_code: 1,
+                    changes: None,
                 }),
             );
             return;
@@ -1106,6 +1387,7 @@ async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
                     page_count
                 ),
                 exit_code: 1,
+                changes: None,
             }),
         );
         return;
@@ -1131,6 +1413,7 @@ async fn handle_read_pdf(tx: &WsSender, call_id: &str, data: Value) {
             call_id: call_id.to_string(),
             output: serde_json::to_string(&content).unwrap_or_default(),
             exit_code: 0,
+            changes: None,
         }),
     );
 }
@@ -1279,6 +1562,8 @@ enum ToolOutbound {
         call_id: String,
         output: String,
         exit_code: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changes: Option<Value>,
     },
     BackgroundOutput {
         job_id: String,
