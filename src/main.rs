@@ -1667,17 +1667,65 @@ fn send(tx: &WsSender, msg: Outbound) {
     }
 }
 
+enum WicketMode {
+    Listen {
+        wicket_url: String,
+        host_identity: String,
+    },
+    HostSwitch {
+        target: String,
+    },
+}
+
+fn is_websocket_url(s: &str) -> bool {
+    s.starts_with("ws://") || s.starts_with("wss://")
+}
+
+fn parse_mode(args: &[String]) -> Result<WicketMode, String> {
+    match args {
+        [program] => Err(format!(
+            "usage: {program} <ws-url> <host-identity>\n       {program} <host>"
+        )),
+        [_, one] if is_websocket_url(one) => Ok(WicketMode::Listen {
+            wicket_url: one.clone(),
+            host_identity: "localhost".to_string(),
+        }),
+        [_, one] => Ok(WicketMode::HostSwitch {
+            target: one.clone(),
+        }),
+        [_, wicket_url, host_identity] if is_websocket_url(wicket_url) => {
+            Ok(WicketMode::Listen {
+                wicket_url: wicket_url.clone(),
+                host_identity: host_identity.clone(),
+            })
+        }
+        [program, ..] => Err(format!(
+            "usage: {program} <ws-url> <host-identity>\n       {program} <host>"
+        )),
+        [] => Err("usage: wicket <ws-url> <host-identity>\n       wicket <host>".to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let wicket_url = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("usage: wicket <ws-url> <host-identity>");
+    let mode = parse_mode(&args).unwrap_or_else(|usage| {
+        eprintln!("{usage}");
         std::process::exit(1);
     });
-    let host_identity = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "localhost".to_string());
+
+    let (wicket_url, host_identity) = match mode {
+        WicketMode::Listen {
+            wicket_url,
+            host_identity,
+        } => (wicket_url, host_identity),
+        WicketMode::HostSwitch { target } => {
+            init_log("host-switch").await;
+            trace!("wicket", "host", "switch_stub", "target": target);
+            println!("would switch shebang host to {}", target);
+            return;
+        }
+    };
 
     init_log(&host_identity).await;
     trace!("wicket", "lifecycle", "starting", "url": wicket_url, "where": host_identity);
