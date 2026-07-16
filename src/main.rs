@@ -539,7 +539,7 @@ mod tests {
             .unwrap()
         };
 
-        let zsh_exec = render(log_record!(0, "tool", "zsh_exec",
+        let execute = render(log_record!(0, "tool", "execute",
             where: "localhost",
             how: "sandboxed",
             command: "hostname",
@@ -552,13 +552,13 @@ mod tests {
         ));
         let connect = render(log_record!(0, "lifecycle", "connect",
             whom: "easement",
-            where: "localhost",
+            where: "ws://localhost:6502",
             how: "websocket",
         ));
 
         assert_eq!(
-            zsh_exec,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"tool","what":"zsh_exec","where":"localhost","how":"sandboxed","noise":0,"with":{"command":"hostname","run_bg":false}}}"#
+            execute,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"tool","what":"execute","where":"localhost","how":"sandboxed","noise":0,"with":{"command":"hostname","run_bg":false}}}"#
         );
         assert_eq!(
             recv,
@@ -566,10 +566,10 @@ mod tests {
         );
         assert_eq!(
             connect,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"lifecycle","whom":"easement","what":"connect","where":"localhost","how":"websocket","noise":0,"with":{}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"lifecycle","whom":"easement","what":"connect","where":"ws://localhost:6502","how":"websocket","noise":0,"with":{}}}"#
         );
 
-        for line in [zsh_exec, recv, connect] {
+        for line in [execute, recv, connect] {
             println!("{line}");
         }
     }
@@ -751,7 +751,7 @@ async fn handle_zsh(
         .and_then(|v| v.as_u64())
         .unwrap_or(300_000);
     let job_id = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
-    trace!("tool", "zsh_exec",
+    trace!("tool", "execute",
         where: host_identity,
         how: if sandboxed { "sandboxed" } else { "unsandboxed" },
         command: command,
@@ -895,7 +895,7 @@ async fn handle_zsh(
                                 job_id: job_id,
                             );
                             if let Err(e) = child.start_kill() {
-                                error!("tool", "kill", e,
+                                error!("tool", "fail_kill", e,
                                     where: host_identity,
                                     job_id: job_id,
                                 );
@@ -915,7 +915,7 @@ async fn handle_zsh(
                     let final_path = match tokio::fs::rename(&output_path, &finished_path).await {
                         Ok(()) => finished_path,
                         Err(e) => {
-                            error!("tool", "rename_job", e,
+                            error!("tool", "fail_rename", e,
                                 where: output_path.display(),
                                 job_id: job_id,
                             );
@@ -1455,7 +1455,11 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         let mut buf = std::io::Cursor::new(Vec::new());
         resized
             .write_to(&mut buf, image::ImageFormat::Jpeg)
-            .unwrap_or_else(|e| error!("tool", "encode_jpeg", e));
+            .unwrap_or_else(|e| {
+                error!("tool", "fail_encode", e,
+                    how: "jpeg",
+                )
+            });
         (buf.into_inner(), rw, rh, "image/jpeg")
     } else {
         let ext = abs_path
@@ -1648,7 +1652,7 @@ fn send(tx: &WsSender, msg: Outbound) {
             );
             let _ = tx.send(json);
         }
-        Err(e) => error!("websocket", "serialize", e,
+        Err(e) => error!("websocket", "fail_serialize", e,
             whom: "easement",
             how: "json",
         ),
@@ -1727,7 +1731,7 @@ async fn main() {
     let (ws_stream, _) = match tokio_tungstenite::connect_async(&wicket_url).await {
         Ok(s) => s,
         Err(e) => {
-            error!("lifecycle", "connect", e,
+            error!("lifecycle", "fail_connect", e,
                 whom: "easement",
                 where: wicket_url,
                 how: "websocket",
@@ -1817,7 +1821,7 @@ async fn main() {
     );
     trace!("lifecycle", "connect",
         whom: "easement",
-        where: host_identity,
+        where: wicket_url,
         how: "websocket",
     );
 
@@ -1830,7 +1834,7 @@ async fn main() {
                     let raw: Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!("websocket", "parse", e,
+                            error!("websocket", "reject", e,
                                 whom: "easement",
                                 how: "json",
                                 raw: text,
@@ -1859,7 +1863,7 @@ async fn main() {
                     let msg: Inbound = match serde_json::from_value(raw.clone()) {
                         Ok(m) => m,
                         Err(e) => {
-                            error!("websocket", "decode", e,
+                            error!("websocket", "reject", e,
                                 whom: "easement",
                                 how: "json",
                                 raw: raw,
@@ -1878,7 +1882,7 @@ async fn main() {
                     break;
                 }
                 Err(e) => {
-                    error!("websocket", "read", e,
+                    error!("websocket", "fail_read", e,
                         whom: "easement",
                         how: "websocket",
                     );
@@ -2039,6 +2043,7 @@ async fn main() {
                     "job_id={} where={} exit_code=-1 output_path={}",
                     failed.job_id, failed.host_identity, output_path_str
                 );
+                // finish_job is the job's terminal event; why says that it finished badly.
                 error!(
                     "tool",
                     "finish_job",
