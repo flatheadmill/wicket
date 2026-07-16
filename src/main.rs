@@ -26,64 +26,102 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Clone, Serialize)]
-struct LogMessage {
-    when: String,
-    level: u8,
-    who: &'static str,
-    what: &'static str,
-    why: &'static str,
-    #[serde(flatten)]
-    payload: Value,
+struct LogRecord {
+    who: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    whom: Option<String>,
+    what: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r#where: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    how: Option<String>,
+    noise: u8,
+    r#with: Value,
 }
 
 #[derive(Serialize)]
 struct LogEntry {
     when: String,
-    what: LogMessage,
+    who: &'static str,
+    what: LogRecord,
 }
 
-static LOG: OnceLock<broadcast::Sender<LogMessage>> = OnceLock::new();
+static LOG: OnceLock<broadcast::Sender<LogRecord>> = OnceLock::new();
 static APPLY_PATCH_CWD_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
-fn log(level: u8, msg: LogMessage) {
+fn log(record: LogRecord) {
     if let Some(tx) = LOG.get() {
-        let _ = tx.send(LogMessage { level, ..msg });
+        let _ = tx.send(record);
     }
 }
 
+macro_rules! log_fields {
+    ($record:ident, $with:ident,) => {};
+    ($record:ident, $with:ident, whom: $value:expr, $($rest:tt)*) => {
+        $record.whom = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, where: $value:expr, $($rest:tt)*) => {
+        $record.r#where = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, why: $value:expr, $($rest:tt)*) => {
+        $record.why = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, how: $value:expr, $($rest:tt)*) => {
+        $record.how = Some(($value).to_string());
+        log_fields!($record, $with, $($rest)*);
+    };
+    ($record:ident, $with:ident, $key:ident: $value:expr, $($rest:tt)*) => {
+        $with.insert(stringify!($key).to_string(), serde_json::json!($value));
+        log_fields!($record, $with, $($rest)*);
+    };
+}
+
+macro_rules! log_record {
+    ($noise:expr, $who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {{
+        let mut record = crate::LogRecord {
+            who: ($who).to_string(),
+            whom: None,
+            what: ($what).to_string(),
+            r#where: None,
+            why: None,
+            how: None,
+            noise: $noise,
+            r#with: serde_json::Value::Null,
+        };
+        #[allow(unused_mut)]
+        let mut details = serde_json::Map::new();
+        log_fields!(record, details, $($key: $value,)*);
+        record.r#with = serde_json::Value::Object(details);
+        record
+    }};
+}
+
 macro_rules! trace {
-    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(0, LogMessage {
-            when: now(), level: 0, who: $who, what: $what, why: $why,
-            payload: serde_json::json!({ $($key: $val),* }),
-        })
+    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
+        crate::log(log_record!(0, $who, $what $(, $key: $value)*))
     };
 }
 
 macro_rules! wire {
-    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(1, LogMessage {
-            when: now(), level: 1, who: $who, what: $what, why: $why,
-            payload: serde_json::json!({ $($key: $val),* }),
-        })
+    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
+        crate::log(log_record!(1, $who, $what $(, $key: $value)*))
     };
 }
 
 macro_rules! dump {
-    ($who:expr, $what:expr, $why:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(2, LogMessage {
-            when: now(), level: 2, who: $who, what: $what, why: $why,
-            payload: serde_json::json!({ $($key: $val),* }),
-        })
+    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
+        crate::log(log_record!(2, $who, $what $(, $key: $value)*))
     };
 }
 
 macro_rules! error {
-    ($who:expr, $what:expr, $how:expr, $error:expr $(, $key:tt: $val:expr)* $(,)?) => {
-        crate::log(0, LogMessage {
-            when: now(), level: 0, who: $who, what: $what, why: "error",
-            payload: serde_json::json!({ "how": $how, "error": $error.to_string() $(, $key: $val)* }),
-        })
+    ($who:expr, $what:expr, $error:expr $(, $key:ident: $value:expr)* $(,)?) => {
+        crate::log(log_record!(0, $who, $what, why: $error.to_string() $(, $key: $value)*))
     };
 }
 
@@ -156,7 +194,7 @@ async fn init_log(host_identity: &str) {
 
     let log_path = log_dir.join(format!("{}.jsonl", host_identity));
 
-    let (tx, _) = broadcast::channel::<LogMessage>(4096);
+    let (tx, _) = broadcast::channel::<LogRecord>(4096);
     let mut rx = tx.subscribe();
     LOG.set(tx).expect("log already initialized");
 
@@ -180,6 +218,7 @@ async fn init_log(host_identity: &str) {
                 Ok(msg) => {
                     let entry = LogEntry {
                         when: now(),
+                        who: "wicket",
                         what: msg,
                     };
                     if let Ok(mut line) = serde_json::to_string(&entry) {
@@ -190,14 +229,11 @@ async fn init_log(host_identity: &str) {
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     let shed = LogEntry {
                         when: now(),
-                        what: LogMessage {
-                            when: now(),
-                            level: 0,
-                            who: "log",
-                            what: "lifecycle",
-                            why: "shed",
-                            payload: json!({ "count": n }),
-                        },
+                        who: "wicket",
+                        what: log_record!(0, "log", "shed",
+                            why: "the log writer fell behind its channel",
+                            count: n,
+                        ),
                     };
                     if let Ok(mut line) = serde_json::to_string(&shed) {
                         line.push('\n');
@@ -490,7 +526,53 @@ async fn run_foreground_command(
 mod tests {
     use codex_apply_patch::{maybe_parse_apply_patch_verified, MaybeApplyPatchVerified};
 
-    use super::patch_changes_for_tui;
+    use super::{patch_changes_for_tui, LogEntry};
+
+    #[test]
+    fn log_entries_use_the_record_envelope_grammar() {
+        let render = |record| {
+            serde_json::to_string(&LogEntry {
+                when: "2026-07-16T12:00:00.000Z".to_string(),
+                who: "wicket",
+                what: record,
+            })
+            .unwrap()
+        };
+
+        let zsh_exec = render(log_record!(0, "tool", "zsh_exec",
+            where: "localhost",
+            how: "sandboxed",
+            command: "hostname",
+            run_bg: false,
+        ));
+        let recv = render(log_record!(1, "websocket", "recv",
+            whom: "easement",
+            how: "websocket",
+            raw: serde_json::json!({ "what": "tool", "why": "run" }),
+        ));
+        let connect = render(log_record!(0, "lifecycle", "connect",
+            whom: "easement",
+            where: "localhost",
+            how: "websocket",
+        ));
+
+        assert_eq!(
+            zsh_exec,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"tool","what":"zsh_exec","where":"localhost","how":"sandboxed","noise":0,"with":{"command":"hostname","run_bg":false}}}"#
+        );
+        assert_eq!(
+            recv,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"websocket","whom":"easement","what":"recv","how":"websocket","noise":1,"with":{"raw":{"what":"tool","why":"run"}}}}"#
+        );
+        assert_eq!(
+            connect,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"lifecycle","whom":"easement","what":"connect","where":"localhost","how":"websocket","noise":0,"with":{}}}"#
+        );
+
+        for line in [zsh_exec, recv, connect] {
+            println!("{line}");
+        }
+    }
 
     #[test]
     fn patch_changes_for_tui_uses_file_change_schema() {
@@ -593,7 +675,10 @@ async fn handle_zsh_foreground(
         cmd.current_dir(&cwd);
         run_foreground_command(cmd, timeout_ms).await
     } else {
-        trace!("wicket", "tool", "unsandboxed", "command": command);
+        trace!("tool", "execute",
+            how: "unsandboxed",
+            command: command,
+        );
         let mut cmd = tokio::process::Command::new("zsh");
         cmd.env("RUNNING_UNDER_WICKET", "1");
         cmd.current_dir(&cwd);
@@ -666,7 +751,12 @@ async fn handle_zsh(
         .and_then(|v| v.as_u64())
         .unwrap_or(300_000);
     let job_id = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
-    trace!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
+    trace!("tool", "zsh_exec",
+        where: host_identity,
+        how: if sandboxed { "sandboxed" } else { "unsandboxed" },
+        command: command,
+        run_bg: run_bg,
+    );
 
     if !run_bg {
         let tx = tx.clone();
@@ -800,9 +890,15 @@ async fn handle_zsh(
                     let status = tokio::select! {
                         status = child.wait() => status,
                         _ = &mut kill_rx => {
-                            trace!("wicket", "tool", "kill", "job_id": job_id);
+                            trace!("tool", "kill",
+                                where: host_identity,
+                                job_id: job_id,
+                            );
                             if let Err(e) = child.start_kill() {
-                                error!("wicket", "tool", "kill", e, "job_id": job_id);
+                                error!("tool", "kill", e,
+                                    where: host_identity,
+                                    job_id: job_id,
+                                );
                             }
                             child.wait().await
                         }
@@ -819,7 +915,10 @@ async fn handle_zsh(
                     let final_path = match tokio::fs::rename(&output_path, &finished_path).await {
                         Ok(()) => finished_path,
                         Err(e) => {
-                            error!("wicket", "tool", "job_rename", e, "job_id": job_id);
+                            error!("tool", "rename_job", e,
+                                where: output_path.display(),
+                                job_id: job_id,
+                            );
                             output_path
                         }
                     };
@@ -865,7 +964,10 @@ async fn handle_zsh(
 // in the tools manifest. Claude cannot discover or call it.
 async fn handle_shell(tx: &WsSender, slug: &str, transcript: &str, call_id: &str, data: Value) {
     let command = data.get("command").and_then(|c| c.as_str()).unwrap_or("");
-    trace!("wicket", "shell", "exec", "command": command);
+    trace!("shell", "execute",
+        how: "unsandboxed",
+        command: command,
+    );
 
     let cwd = match ensure_pane_dir(slug).await {
         Ok(cwd) => cwd,
@@ -1133,7 +1235,9 @@ fn patch_changes_for_tui(action: &ApplyPatchAction) -> Vec<Value> {
 // too, but checking first gives a clear error instead of a cryptic seatbelt denial.
 async fn handle_apply_patch(tx: &WsSender, slug: &str, call_id: &str, data: Value) {
     let patch = data.get("patch").and_then(|v| v.as_str()).unwrap_or("");
-    trace!("wicket", "tool", "apply_patch");
+    trace!("tool", "apply_patch",
+        how: "sandboxed",
+    );
 
     let sandbox_config = read_sandbox_config(slug).await;
     let cwd = match ensure_pane_dir(slug).await {
@@ -1303,7 +1407,9 @@ fn resolve_tool_path(path_str: &str) -> PathBuf {
 // Preserves source format when possible, falls back to JPEG on resize.
 async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
     let path_str = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    trace!("wicket", "tool", "view_image", "path": path_str);
+    trace!("tool", "view_image",
+        where: path_str,
+    );
 
     let abs_path = resolve_tool_path(path_str);
 
@@ -1349,7 +1455,7 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         let mut buf = std::io::Cursor::new(Vec::new());
         resized
             .write_to(&mut buf, image::ImageFormat::Jpeg)
-            .unwrap_or_else(|e| error!("wicket", "tool", "jpeg_encode_failed", e));
+            .unwrap_or_else(|e| error!("tool", "encode_jpeg", e));
         (buf.into_inner(), rw, rh, "image/jpeg")
     } else {
         let ext = abs_path
@@ -1367,7 +1473,12 @@ async fn handle_view_image(tx: &WsSender, call_id: &str, data: Value) {
         (file_bytes, w, h, media_type)
     };
 
-    trace!("wicket", "tool", "view_image_encoded", "original": format!("{}x{}", w, h), "output": format!("{}x{}", output_w, output_h), "resized": needs_resize, "bytes": output_bytes.len());
+    trace!("tool", "encode_image",
+        original: format!("{}x{}", w, h),
+        output: format!("{}x{}", output_w, output_h),
+        resized: needs_resize,
+        bytes: output_bytes.len(),
+    );
 
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&output_bytes);
@@ -1530,10 +1641,17 @@ enum ShellOutbound {
 fn send(tx: &WsSender, msg: Outbound) {
     match serde_json::to_string(&msg) {
         Ok(json) => {
-            wire!("wicket", "websocket", "send", "raw": json);
+            wire!("websocket", "send",
+                whom: "easement",
+                how: "websocket",
+                raw: json,
+            );
             let _ = tx.send(json);
         }
-        Err(e) => error!("wicket", "websocket", "serialize", e),
+        Err(e) => error!("websocket", "serialize", e,
+            whom: "easement",
+            how: "json",
+        ),
     }
 }
 
@@ -1589,19 +1707,31 @@ async fn main() {
         } => (wicket_url, host_identity),
         WicketMode::HostSwitch { target } => {
             init_log("host-switch").await;
-            trace!("wicket", "host", "switch_stub", "target": target);
+            trace!("host", "switch",
+                where: target,
+                how: "stub",
+            );
             println!("would switch shebang host to {}", target);
             return;
         }
     };
 
     init_log(&host_identity).await;
-    trace!("wicket", "lifecycle", "starting", "url": wicket_url, "where": host_identity);
+    trace!("lifecycle", "start",
+        whom: "easement",
+        where: host_identity,
+        how: "websocket",
+        url: wicket_url,
+    );
 
     let (ws_stream, _) = match tokio_tungstenite::connect_async(&wicket_url).await {
         Ok(s) => s,
         Err(e) => {
-            error!("wicket", "lifecycle", "connect_failed", e);
+            error!("lifecycle", "connect", e,
+                whom: "easement",
+                where: wicket_url,
+                how: "websocket",
+            );
             eprintln!("cannot connect to easement: {}", e);
             std::process::exit(1);
         }
@@ -1685,7 +1815,11 @@ async fn main() {
             ],
         }),
     );
-    trace!("wicket", "lifecycle", "connected");
+    trace!("lifecycle", "connect",
+        whom: "easement",
+        where: host_identity,
+        how: "websocket",
+    );
 
     let reader_tx = router_tx.clone();
     tokio::spawn(async move {
@@ -1696,23 +1830,40 @@ async fn main() {
                     let raw: Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!("wicket", "websocket", "parse_json", e, "raw": text);
+                            error!("websocket", "parse", e,
+                                whom: "easement",
+                                how: "json",
+                                raw: text,
+                            );
                             continue;
                         }
                     };
 
                     let what = raw.get("what").and_then(|v| v.as_str()).unwrap_or("");
                     if what == "tool" || what == "shell" {
-                        wire!("wicket", "websocket", "recv", "raw": raw);
+                        wire!("websocket", "recv",
+                            whom: "easement",
+                            how: "websocket",
+                            raw: raw,
+                        );
                     } else {
-                        dump!("wicket", "websocket", "ignored", "raw": raw);
+                        dump!("websocket", "ignore",
+                            whom: "easement",
+                            why: "the frame is not a tool or shell dispatch",
+                            how: "websocket",
+                            raw: raw,
+                        );
                         continue;
                     }
 
                     let msg: Inbound = match serde_json::from_value(raw.clone()) {
                         Ok(m) => m,
                         Err(e) => {
-                            error!("wicket", "websocket", "decode", e, "raw": raw);
+                            error!("websocket", "decode", e,
+                                whom: "easement",
+                                how: "json",
+                                raw: raw,
+                            );
                             continue;
                         }
                     };
@@ -1727,7 +1878,10 @@ async fn main() {
                     break;
                 }
                 Err(e) => {
-                    error!("wicket", "websocket", "read", e);
+                    error!("websocket", "read", e,
+                        whom: "easement",
+                        how: "websocket",
+                    );
                     let _ = reader_tx.send(Event::Disconnected);
                     sent_disconnect = true;
                     break;
@@ -1760,7 +1914,10 @@ async fn main() {
                     if tool_where != &host_identity {
                         continue;
                     }
-                    trace!("wicket", "tool", "run", "call_id": call_id);
+                    trace!("tool", "run",
+                        where: host_identity,
+                        call_id: call_id,
+                    );
 
                     match tool {
                         ToolCall::Zsh {
@@ -1836,7 +1993,11 @@ async fn main() {
                     if r#where != host_identity {
                         continue;
                     }
-                    trace!("wicket", "shell", "run", "id": id, "command": command);
+                    trace!("shell", "run",
+                        where: host_identity,
+                        id: id,
+                        command: command,
+                    );
                     let tx = ws_tx.clone();
                     tokio::spawn(async move {
                         let shell_data = json!({ "command": command });
@@ -1852,11 +2013,14 @@ async fn main() {
                     finished.job_id, finished.host_identity, finished.exit_code, output_path_str
                 );
                 trace!(
-                    "wicket",
                     "tool",
-                    "notification",
-                    "job_id": finished.job_id,
-                    "exit_code": finished.exit_code
+                    "notify",
+                    whom: "easement",
+                    where: finished.host_identity,
+                    why: "the background job exited",
+                    how: "websocket",
+                    job_id: finished.job_id,
+                    exit_code: finished.exit_code,
                 );
                 send(
                     &ws_tx,
@@ -1876,11 +2040,12 @@ async fn main() {
                     failed.job_id, failed.host_identity, output_path_str
                 );
                 error!(
-                    "wicket",
                     "tool",
-                    "job_failed",
+                    "finish_job",
                     std::io::Error::new(std::io::ErrorKind::Other, failed.error.clone()),
-                    "job_id": failed.job_id
+                    where: failed.host_identity,
+                    how: "process",
+                    job_id: failed.job_id,
                 );
                 send(
                     &ws_tx,
@@ -1903,5 +2068,5 @@ async fn main() {
         }
     }
 
-    trace!("wicket", "lifecycle", "shutdown");
+    trace!("lifecycle", "shutdown");
 }
