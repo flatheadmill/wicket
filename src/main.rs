@@ -220,7 +220,6 @@ type RunningJobs = HashMap<String, RunningJob>;
 struct RunningJobInfo {
     job_id: String,
     slug: String,
-    transcript: String,
     r#where: String,
     command: String,
     output_path: String,
@@ -235,7 +234,6 @@ struct RunningJob {
 struct JobFinished {
     job_id: String,
     slug: String,
-    transcript: String,
     host_identity: String,
     exit_code: i32,
     output_path: PathBuf,
@@ -244,7 +242,6 @@ struct JobFinished {
 struct JobFailed {
     job_id: String,
     slug: String,
-    transcript: String,
     host_identity: String,
     error: String,
     output_path: PathBuf,
@@ -520,6 +517,45 @@ mod tests {
 
         std::fs::remove_dir_all(&cwd).unwrap();
     }
+
+    #[test]
+    fn tool_run_decodes_with_and_without_transcript() {
+        let with_transcript = serde_json::json!({
+            "what": "tool",
+            "why": "run",
+            "slug": "puzzle",
+            "transcript": "",
+            "call_id": "call-1",
+            "f": "zsh",
+            "command": "hostname",
+            "where": "localhost"
+        });
+        let without_transcript = serde_json::json!({
+            "what": "tool",
+            "why": "run",
+            "slug": "puzzle",
+            "call_id": "call-2",
+            "f": "zsh",
+            "command": "hostname",
+            "where": "localhost"
+        });
+
+        let with: super::Inbound = serde_json::from_value(with_transcript).unwrap();
+        let without: super::Inbound = serde_json::from_value(without_transcript).unwrap();
+
+        match with {
+            super::Inbound::Tool(super::ToolInbound::Run { transcript, .. }) => {
+                assert_eq!(transcript, "");
+            }
+            _ => panic!("expected tool run"),
+        }
+        match without {
+            super::Inbound::Tool(super::ToolInbound::Run { transcript, .. }) => {
+                assert_eq!(transcript, "");
+            }
+            _ => panic!("expected tool run"),
+        }
+    }
 }
 
 // Sandboxed shell. Runs inside seatbelt or bubblewrap. Supports foreground (wait for
@@ -629,10 +665,6 @@ async fn handle_zsh(
         .get("timeout")
         .and_then(|v| v.as_u64())
         .unwrap_or(300_000);
-    let transcript = data
-        .get("transcript")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
     let job_id = data.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
     trace!("wicket", "tool", "zsh_exec", "command": command, "sandboxed": sandboxed, "run_bg": run_bg);
 
@@ -707,7 +739,6 @@ async fn handle_zsh(
                         info: RunningJobInfo {
                             job_id: job_id.to_string(),
                             slug: slug.to_string(),
-                            transcript: transcript.to_string(),
                             r#where: host_identity.to_string(),
                             command: command.to_string(),
                             output_path: output_path.to_string_lossy().to_string(),
@@ -735,7 +766,6 @@ async fn handle_zsh(
                 let router_tx = router_tx.clone();
                 let output_path = output_path.clone();
                 let slug = slug.to_string();
-                let transcript = transcript.to_string();
                 let host_identity = host_identity.to_string();
                 let job_id = job_id.to_string();
                 let is_localhost = host_identity == "localhost";
@@ -798,7 +828,6 @@ async fn handle_zsh(
                             let _ = router_tx.send(Event::JobFinished(JobFinished {
                                 job_id,
                                 slug,
-                                transcript,
                                 host_identity,
                                 exit_code: code,
                                 output_path: final_path,
@@ -808,7 +837,6 @@ async fn handle_zsh(
                             let _ = router_tx.send(Event::JobFailed(JobFailed {
                                 job_id,
                                 slug,
-                                transcript,
                                 host_identity,
                                 error: e.to_string(),
                                 output_path: final_path,
@@ -959,25 +987,17 @@ async fn handle_jobs(
     tx: &WsSender,
     jobs: &RunningJobs,
     slug: &str,
-    transcript: &str,
     call_id: &str,
     host_identity: &str,
 ) {
     let jobs = jobs
         .values()
-        .filter(|job| {
-            job.info.slug == slug
-                && job.info.transcript == transcript
-                && job.info.r#where == host_identity
-        })
+        .filter(|job| job.info.slug == slug && job.info.r#where == host_identity)
         .map(|job| job.info.clone())
         .collect::<Vec<_>>();
 
     let output = if jobs.is_empty() {
-        format!(
-            "no running jobs for slug {} transcript {} on {}",
-            slug, transcript, host_identity
-        )
+        format!("no running jobs for slug {} on {}", slug, host_identity)
     } else {
         serde_json::to_string_pretty(&jobs).unwrap_or_else(|_| "[]".to_string())
     };
@@ -997,7 +1017,6 @@ async fn handle_kill(
     tx: &WsSender,
     jobs: &mut RunningJobs,
     slug: &str,
-    transcript: &str,
     call_id: &str,
     host_identity: &str,
     job_id: &str,
@@ -1008,8 +1027,8 @@ async fn handle_kill(
             Outbound::Tool(ToolOutbound::Response {
                 call_id: call_id.to_string(),
                 output: format!(
-                    "job {} is not running for slug {} transcript {} on {}",
-                    job_id, slug, transcript, host_identity
+                    "job {} is not running for slug {} on {}",
+                    job_id, slug, host_identity
                 ),
                 exit_code: 1,
                 changes: None,
@@ -1018,17 +1037,14 @@ async fn handle_kill(
         return;
     };
 
-    if job.info.slug != slug
-        || job.info.transcript != transcript
-        || job.info.r#where != host_identity
-    {
+    if job.info.slug != slug || job.info.r#where != host_identity {
         send(
             tx,
             Outbound::Tool(ToolOutbound::Response {
                 call_id: call_id.to_string(),
                 output: format!(
-                    "job {} is not running for slug {} transcript {} on {}",
-                    job_id, slug, transcript, host_identity
+                    "job {} is not running for slug {} on {}",
+                    job_id, slug, host_identity
                 ),
                 exit_code: 1,
                 changes: None,
@@ -1395,6 +1411,8 @@ enum Inbound {
 enum ToolInbound {
     Run {
         slug: String,
+        #[serde(default)]
+        #[allow(dead_code)]
         transcript: String,
         call_id: String,
         #[serde(flatten)]
@@ -1545,12 +1563,10 @@ fn parse_mode(args: &[String]) -> Result<WicketMode, String> {
         [_, one] => Ok(WicketMode::HostSwitch {
             target: one.clone(),
         }),
-        [_, wicket_url, host_identity] if is_websocket_url(wicket_url) => {
-            Ok(WicketMode::Listen {
-                wicket_url: wicket_url.clone(),
-                host_identity: host_identity.clone(),
-            })
-        }
+        [_, wicket_url, host_identity] if is_websocket_url(wicket_url) => Ok(WicketMode::Listen {
+            wicket_url: wicket_url.clone(),
+            host_identity: host_identity.clone(),
+        }),
         [program, ..] => Err(format!(
             "usage: {program} <ws-url> <host-identity>\n       {program} <host>"
         )),
@@ -1654,17 +1670,16 @@ async fn main() {
                 },
                 ToolDef {
                     f: "jobs".to_string(),
-                    description: "List currently running background jobs for this slug and \
-                                  transcript on this host. Does not scan saved job files. Args: \
-                                  where (string, required — the host identity)."
+                    description: "List currently running background jobs for this slug on this \
+                                  host. Does not scan saved job files. Args: where (string, \
+                                  required — the host identity)."
                         .to_string(),
                 },
                 ToolDef {
                     f: "kill".to_string(),
-                    description: "Kill a currently running background job for this slug and \
-                                  transcript on this host. Args: job_id (string, required — the \
-                                  running background job ID), where (string, required — the host \
-                                  identity)."
+                    description: "Kill a currently running background job for this slug on this \
+                                  host. Args: job_id (string, required — the running background \
+                                  job ID), where (string, required — the host identity)."
                         .to_string(),
                 },
             ],
@@ -1730,7 +1745,7 @@ async fn main() {
             Event::Inbound(msg) => match msg {
                 Inbound::Tool(ToolInbound::Run {
                     slug,
-                    transcript,
+                    transcript: _,
                     call_id,
                     tool,
                 }) => {
@@ -1761,7 +1776,6 @@ async fn main() {
                                 "run_in_background": run_in_background,
                                 "timeout": timeout,
                                 "job_id": call_id,
-                                "transcript": transcript,
                             });
                             handle_zsh(
                                 &ws_tx,
@@ -1796,22 +1810,14 @@ async fn main() {
                             });
                         }
                         ToolCall::Jobs { .. } => {
-                            handle_jobs(
-                                &ws_tx,
-                                &running_jobs,
-                                &slug,
-                                &transcript,
-                                &call_id,
-                                &host_identity,
-                            )
-                            .await;
+                            handle_jobs(&ws_tx, &running_jobs, &slug, &call_id, &host_identity)
+                                .await;
                         }
                         ToolCall::Kill { job_id, .. } => {
                             handle_kill(
                                 &ws_tx,
                                 &mut running_jobs,
                                 &slug,
-                                &transcript,
                                 &call_id,
                                 &host_identity,
                                 &job_id,
@@ -1856,7 +1862,7 @@ async fn main() {
                     &ws_tx,
                     Outbound::Tool(ToolOutbound::Notification {
                         slug: finished.slug,
-                        transcript: finished.transcript,
+                        transcript: "".to_string(),
                         message: "Background job exited.".to_string(),
                         meta: Some(meta),
                     }),
@@ -1880,7 +1886,7 @@ async fn main() {
                     &ws_tx,
                     Outbound::Tool(ToolOutbound::Notification {
                         slug: failed.slug,
-                        transcript: failed.transcript,
+                        transcript: "".to_string(),
                         message: "Background job exited.".to_string(),
                         meta: Some(meta),
                     }),
