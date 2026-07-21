@@ -536,6 +536,12 @@ mod tests {
             how: "websocket",
             raw: serde_json::json!({ "what": "tool", "why": "run" }),
         ));
+        let unrecognized = render(log_record!("wire", "unrecognized",
+            whom: "easement",
+            why: "the frame is not a tool or shell dispatch",
+            how: "websocket",
+            raw: serde_json::json!({ "what": "heartbeat" }),
+        ));
         let connect = render(log_record!("lifecycle", "connect",
             whom: "easement",
             where: "ws://localhost:6502",
@@ -551,11 +557,15 @@ mod tests {
             r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"wire","whom":"easement","what":"recv","how":"websocket","with":{"raw":{"what":"tool","why":"run"}}}}"#
         );
         assert_eq!(
+            unrecognized,
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"wire","whom":"easement","what":"unrecognized","why":"the frame is not a tool or shell dispatch","how":"websocket","with":{"raw":{"what":"heartbeat"}}}}"#
+        );
+        assert_eq!(
             connect,
             r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"lifecycle","whom":"easement","what":"connect","where":"ws://localhost:6502","how":"websocket","with":{}}}"#
         );
 
-        for line in [execute, recv, connect] {
+        for line in [execute, recv, unrecognized, connect] {
             println!("{line}");
         }
     }
@@ -1638,7 +1648,7 @@ fn send(tx: &WsSender, msg: Outbound) {
             );
             let _ = tx.send(json);
         }
-        Err(e) => error!("websocket", "fail_serialize", e,
+        Err(e) => error!("wire", "fail_serialize", e,
             whom: "easement",
             how: "json",
         ),
@@ -1820,7 +1830,7 @@ async fn main() {
                     let raw: Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
-                            error!("websocket", "reject", e,
+                            error!("wire", "reject", e,
                                 whom: "easement",
                                 how: "json",
                                 raw: text,
@@ -1837,13 +1847,19 @@ async fn main() {
                             raw: raw,
                         );
                     } else {
+                        trace!("wire", "unrecognized",
+                            whom: "easement",
+                            why: "the frame is not a tool or shell dispatch",
+                            how: "websocket",
+                            raw: raw,
+                        );
                         continue;
                     }
 
                     let msg: Inbound = match serde_json::from_value(raw.clone()) {
                         Ok(m) => m,
                         Err(e) => {
-                            error!("websocket", "reject", e,
+                            error!("wire", "reject", e,
                                 whom: "easement",
                                 how: "json",
                                 raw: raw,
