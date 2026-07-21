@@ -37,7 +37,6 @@ struct LogRecord {
     why: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     how: Option<String>,
-    noise: u8,
     r#with: Value,
 }
 
@@ -82,7 +81,7 @@ macro_rules! log_fields {
 }
 
 macro_rules! log_record {
-    ($noise:expr, $who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {{
+    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {{
         let mut record = crate::LogRecord {
             who: ($who).to_string(),
             whom: None,
@@ -90,7 +89,6 @@ macro_rules! log_record {
             r#where: None,
             why: None,
             how: None,
-            noise: $noise,
             r#with: serde_json::Value::Null,
         };
         #[allow(unused_mut)]
@@ -103,25 +101,13 @@ macro_rules! log_record {
 
 macro_rules! trace {
     ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
-        crate::log(log_record!(0, $who, $what $(, $key: $value)*))
-    };
-}
-
-macro_rules! wire {
-    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
-        crate::log(log_record!(1, $who, $what $(, $key: $value)*))
-    };
-}
-
-macro_rules! dump {
-    ($who:expr, $what:expr $(, $key:ident: $value:expr)* $(,)?) => {
-        crate::log(log_record!(2, $who, $what $(, $key: $value)*))
+        crate::log(log_record!($who, $what $(, $key: $value)*))
     };
 }
 
 macro_rules! error {
     ($who:expr, $what:expr, $error:expr $(, $key:ident: $value:expr)* $(,)?) => {
-        crate::log(log_record!(0, $who, $what, why: $error.to_string() $(, $key: $value)*))
+        crate::log(log_record!($who, $what, why: $error.to_string() $(, $key: $value)*))
     };
 }
 
@@ -230,7 +216,7 @@ async fn init_log(host_identity: &str) {
                     let shed = LogEntry {
                         when: now(),
                         who: "wicket",
-                        what: log_record!(0, "log", "shed",
+                        what: log_record!("log", "shed",
                             why: "the log writer fell behind its channel",
                             count: n,
                         ),
@@ -539,18 +525,18 @@ mod tests {
             .unwrap()
         };
 
-        let execute = render(log_record!(0, "tool", "execute",
+        let execute = render(log_record!("tool", "execute",
             where: "localhost",
             how: "sandboxed",
             command: "hostname",
             run_bg: false,
         ));
-        let recv = render(log_record!(1, "websocket", "recv",
+        let recv = render(log_record!("wire", "recv",
             whom: "easement",
             how: "websocket",
             raw: serde_json::json!({ "what": "tool", "why": "run" }),
         ));
-        let connect = render(log_record!(0, "lifecycle", "connect",
+        let connect = render(log_record!("lifecycle", "connect",
             whom: "easement",
             where: "ws://localhost:6502",
             how: "websocket",
@@ -558,15 +544,15 @@ mod tests {
 
         assert_eq!(
             execute,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"tool","what":"execute","where":"localhost","how":"sandboxed","noise":0,"with":{"command":"hostname","run_bg":false}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"tool","what":"execute","where":"localhost","how":"sandboxed","with":{"command":"hostname","run_bg":false}}}"#
         );
         assert_eq!(
             recv,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"websocket","whom":"easement","what":"recv","how":"websocket","noise":1,"with":{"raw":{"what":"tool","why":"run"}}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"wire","whom":"easement","what":"recv","how":"websocket","with":{"raw":{"what":"tool","why":"run"}}}}"#
         );
         assert_eq!(
             connect,
-            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"lifecycle","whom":"easement","what":"connect","where":"ws://localhost:6502","how":"websocket","noise":0,"with":{}}}"#
+            r#"{"when":"2026-07-16T12:00:00.000Z","who":"wicket","what":{"who":"lifecycle","whom":"easement","what":"connect","where":"ws://localhost:6502","how":"websocket","with":{}}}"#
         );
 
         for line in [execute, recv, connect] {
@@ -1645,7 +1631,7 @@ enum ShellOutbound {
 fn send(tx: &WsSender, msg: Outbound) {
     match serde_json::to_string(&msg) {
         Ok(json) => {
-            wire!("websocket", "send",
+            trace!("wire", "send",
                 whom: "easement",
                 how: "websocket",
                 raw: json,
@@ -1845,18 +1831,12 @@ async fn main() {
 
                     let what = raw.get("what").and_then(|v| v.as_str()).unwrap_or("");
                     if what == "tool" || what == "shell" {
-                        wire!("websocket", "recv",
+                        trace!("wire", "recv",
                             whom: "easement",
                             how: "websocket",
                             raw: raw,
                         );
                     } else {
-                        dump!("websocket", "ignore",
-                            whom: "easement",
-                            why: "the frame is not a tool or shell dispatch",
-                            how: "websocket",
-                            raw: raw,
-                        );
                         continue;
                     }
 
