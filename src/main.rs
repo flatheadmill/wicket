@@ -271,6 +271,7 @@ struct JobFailed {
 
 enum Event {
     Inbound(Inbound),
+    Screenshot(wicket::screenshot_wire::Request),
     JobFinished(JobFinished),
     JobFailed(JobFailed),
     Disconnected,
@@ -1742,6 +1743,13 @@ async fn main() {
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
     let (router_tx, mut router_rx) = mpsc::unbounded_channel::<Event>();
     let mut running_jobs: RunningJobs = HashMap::new();
+    let (ingress_tx, mut ingress_rx) =
+        mpsc::channel::<Event>(wicket::screenshot_wire::QUEUE_CAPACITY);
+    let (screenshot_tx, mut screenshot_rx) = mpsc::channel::<wicket::screenshot_wire::Completion>(
+        wicket::screenshot_wire::QUEUE_CAPACITY,
+    );
+    let screenshot_home = PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
+    let mut screenshot_worker: Option<wicket::screenshot_wire::Worker> = None;
 
     tokio::spawn(async move {
         while let Some(msg) = ws_rx.recv().await {
@@ -1827,13 +1835,38 @@ async fn main() {
         while let Some(result) = ws_stream_rx.next().await {
             match result {
                 Ok(Message::Text(text)) => {
+                    // Inspect the family before materializing a large data field or
+                    // entering either raw logging path. Errors never quote input.
+                    #[derive(serde::Deserialize)]
+                    struct Header {
+                        what: String,
+                    }
+                    let header: Header = match serde_json::from_str(&text) {
+                        Ok(header) => header,
+                        Err(_) => {
+                            trace!("wire", "reject", why: "invalid JSON envelope");
+                            continue;
+                        }
+                    };
+                    if header.what == "screenshot_save" {
+                        match wicket::screenshot_wire::Request::parse(&text) {
+                            Ok(request) => {
+                                if ingress_tx.send(Event::Screenshot(request)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(reason) => {
+                                trace!("screenshot", "reject", why: reason);
+                            }
+                        }
+                        continue;
+                    }
                     let raw: Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
                             error!("wire", "reject", e,
-                                whom: "easement",
-                                how: "json",
-                                raw: text,
+                            whom: "easement",
+                            how: "json",
                             );
                             continue;
                         }
@@ -1849,9 +1882,8 @@ async fn main() {
                     } else {
                         trace!("wire", "unrecognized",
                             whom: "easement",
-                            why: "the frame is not a tool or shell dispatch",
+                            why: "the frame is not a recognized dispatch",
                             how: "websocket",
-                            raw: raw,
                         );
                         continue;
                     }
@@ -1868,7 +1900,7 @@ async fn main() {
                         }
                     };
 
-                    if reader_tx.send(Event::Inbound(msg)).is_err() {
+                    if ingress_tx.send(Event::Inbound(msg)).await.is_err() {
                         break;
                     }
                 }
@@ -1894,8 +1926,47 @@ async fn main() {
         }
     });
 
-    while let Some(event) = router_rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            Some(event) = router_rx.recv() => event,
+            Some(event) = ingress_rx.recv() => event,
+            Some(completion) = screenshot_rx.recv() => {
+                // Quiet protocol replies and opaque factual records use separate
+                // packets. No screenshot bytes go through send()'s raw logger.
+                for record in completion.observations {
+                    let packet = json!({ "what": "log", "why": "write", "whom": "wicket", "with": record });
+                    let _ = ws_tx.send(packet.to_string()); // best-effort observation
+                }
+                if ws_tx.send(completion.packet.to_string()).is_err() { break; }
+                continue;
+            }
+        };
         match event {
+            Event::Screenshot(request) => {
+                if host_identity != "localhost" {
+                    let _ = ws_tx.send(
+                        request
+                            .unavailable("screenshot writer must be local")
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let worker = screenshot_worker.get_or_insert_with(|| {
+                    wicket::screenshot_wire::Worker::start(
+                        screenshot_home.clone(),
+                        screenshot_tx.clone(),
+                    )
+                });
+                if let Err(request) = worker.submit(request) {
+                    let _ = ws_tx.send(
+                        request
+                            .unavailable(
+                                "screenshot worker queue unavailable; reconcile by operation ID",
+                            )
+                            .to_string(),
+                    );
+                }
+            }
             Event::Inbound(msg) => match msg {
                 Inbound::Tool(ToolInbound::Run {
                     slug,
@@ -2069,5 +2140,12 @@ async fn main() {
         }
     }
 
+    // EOF must not abandon an in-progress synchronous publication. Closing
+    // results releases a worker blocked on output; Store then tears down only
+    // temporary receiving and preserves accepted operation evidence.
+    screenshot_rx.close();
+    if let Some(worker) = screenshot_worker {
+        worker.shutdown().await;
+    }
     trace!("lifecycle", "shutdown");
 }
